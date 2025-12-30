@@ -327,7 +327,7 @@ mod splitter_tests {
             let b = w[1];
             let mut overlap_chars = 0;
             for i in (1..=a.len().min(b.len())).rev() {
-                if &a[a.len() - i..] == &b[0..i] {
+                if a[a.len() - i..] == b[0..i] {
                     overlap_chars = i;
                     break;
                 }
@@ -488,12 +488,6 @@ impl Embedder {
 #[cfg(test)]
 mod embedder_tests {
     use super::*;
-
-    fn test_data_path(filename: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests_data")
-            .join(filename)
-    }
 
     #[tokio::test]
     async fn split_large_text() -> Result<()> {

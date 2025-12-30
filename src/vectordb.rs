@@ -791,7 +791,7 @@ mod db_tests {
         let conn = db.connect().await?;
 
         // Insert 5 documents with different similarity to query [1, 0, 0]
-        let doc_ids = vec![
+        let doc_ids = [
             conn.insert_document(
                 "Doc 1",
                 json!({"name": "doc1"}),
@@ -833,12 +833,12 @@ mod db_tests {
         let results_vectors = conn.search_topk_with_vectors(query.clone(), k).await?;
 
         // All should return same number of results
-        assert_eq!(results_basic.len(), k as usize);
-        assert_eq!(results_distance.len(), k as usize);
-        assert_eq!(results_vectors.len(), k as usize);
+        assert_eq!(results_basic.len(), k);
+        assert_eq!(results_distance.len(), k);
+        assert_eq!(results_vectors.len(), k);
 
         // Verify all three return the same doc_ids in the same order
-        for i in 0..k as usize {
+        for i in 0..k {
             let doc_id_basic = results_basic[i].0;
             let doc_id_distance = results_distance[i].0;
             let doc_id_vectors = results_vectors[i].0;
