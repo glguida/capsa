@@ -92,6 +92,30 @@ impl DocumentDatabase {
         Ok(DocumentDatabase { embedder, vdb })
     }
 
+    /// Creates a new document database with a custom embedder.
+    /// 
+    /// This constructor is useful for testing with mock embedders.
+    ///
+    /// # Arguments
+    ///
+    /// * `embedder` - An embedder instance to use for generating embeddings
+    /// * `vdb_path` - Path to the vector database file
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be initialized.
+    pub async fn with_embedder(embedder: Embedder, vdb_path: String) -> Result<Self> {
+        let embedder = Arc::new(embedder);
+        
+        // Retrieve vector size by having a test query.
+        let test_vec = embedder.embed_query("test").await?;
+        let vec_size = test_vec.len();
+
+        let vdb = VectorDatabase::new(&vdb_path, vec_size).await?;
+
+        Ok(DocumentDatabase { embedder, vdb })
+    }
+
     pub async fn connect(&self) -> Result<DocumentDatabaseConnection> {
         let vconn = self.vdb.connect().await?;
         let embedder = self.embedder.clone();
@@ -103,26 +127,65 @@ impl DocumentDatabase {
 mod tests {
     use super::*;
     use serde_json::json;
+    use crate::embedder::{EmbedderClient, Embedder};
+    use async_trait::async_trait;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    /// Mock embedding client for testing.
+    /// 
+    /// Generates deterministic fake embeddings based on the input text hash.
+    pub struct MockEmbeddingClient {
+        embedding_size: usize,
+    }
+
+    impl MockEmbeddingClient {
+        pub fn new(embedding_size: usize) -> Self {
+            Self { embedding_size }
+        }
+    }
+
+    #[async_trait]
+    impl EmbedderClient for MockEmbeddingClient {
+        async fn embed_raw(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+            if input.is_empty() {
+                return Err(anyhow::anyhow!("Empty input not allowed"));
+            }
+            
+            // Generate a deterministic embedding based on input hash
+            let mut hasher = DefaultHasher::new();
+            input.hash(&mut hasher);
+            let hash = hasher.finish();
+            
+            // Create a simple embedding vector
+            let mut embedding = vec![0.0; self.embedding_size];
+            for i in 0..self.embedding_size {
+                // Use different parts of the hash for each dimension
+                let val = ((hash.wrapping_mul((i + 1) as u64)) % 1000) as f32 / 1000.0;
+                embedding[i] = val;
+            }
+            
+            Ok(embedding)
+        }
+    }
 
     async fn create_test_db(db_path: &str) -> Result<DocumentDatabase> {
-        DocumentDatabase::new(
-            "http://localhost:9000/v1".to_string(),
-            "nomic-ai/nomic-embed-text-v1.5".to_string(),
-            Some("test".to_string()),
-            512,
-            db_path.to_string(),
-        )
-        .await
+        // Use mock client to avoid network dependencies
+        let client = Box::new(MockEmbeddingClient::new(384));
+        // Skip test if tokenizer is unavailable (no network/cache)
+        let embedder = match Embedder::with_client(client, "bert-base-uncased", 512) {
+            Ok(e) => e,
+            Err(_) => return Err(anyhow::anyhow!("Tokenizer unavailable")),
+        };
+        DocumentDatabase::with_embedder(embedder, db_path.to_string()).await
     }
 
     #[tokio::test]
     async fn test_document_database_creation() -> Result<()> {
-        let db = create_test_db(":memory:").await;
-        if db.is_err() {
-            // Skip test if embedding server is not available
-            return Ok(());
-        }
-        let db = db?;
+        let db = match create_test_db(":memory:").await {
+            Ok(db) => db,
+            Err(_) => return Ok(()), // Skip if tokenizer unavailable
+        };
         let conn = db.connect().await?;
         drop(conn);
         Ok(())
@@ -132,7 +195,7 @@ mod tests {
     async fn test_insert_and_search() -> Result<()> {
         let db = match create_test_db(":memory:").await {
             Ok(db) => db,
-            Err(_) => return Ok(()), // Skip if server not available
+            Err(_) => return Ok(()), // Skip if tokenizer unavailable
         };
         let conn = db.connect().await?;
 
