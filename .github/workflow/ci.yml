@@ -1,0 +1,73 @@
+# Continuous Integration for Rust project: format, clippy, tests, audit
+# Runs on pushes and pull requests.
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - "**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Rust toolchain and components
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          profile: minimal
+          components: rustfmt, clippy
+
+      - name: Show rustc and cargo versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check formatting (cargo fmt)
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-features --verbose
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+
+      - name: Run cargo-audit (dependency vulnerabilities)
+        run: cargo audit --deny warnings
+        continue-on-error: false
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked || true
+
+      - name: Run cargo-deny (dependency policy)
+        # cargo-deny may need a config; run it but don't fail the whole CI if not configured
+        run: cargo deny check || true
+
+      - name: Run Semgrep (optional security lints)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: 'p/ci' # uses an r2c recommended baseline; change if desired
+        continue-on-error: true
