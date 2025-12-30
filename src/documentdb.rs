@@ -11,12 +11,7 @@ pub struct DocumentDatabaseConnection {
 }
 
 impl DocumentDatabaseConnection {
-    pub async fn insert(&self, metadata: serde_json::Value, text: &str) -> Result<DocumentId> {
-        self.insert_with_progress(metadata, text, None::<fn(usize)>, None::<fn(usize)>)
-            .await
-    }
-
-    /// Inserts a document with progress callbacks.
+    /// Inserts a document
     ///
     /// Works identically to `insert` but invokes optional callbacks during
     /// embedding and database insertion phases with cumulative chunk count.
@@ -25,8 +20,6 @@ impl DocumentDatabaseConnection {
     ///
     /// * `metadata` - Document metadata as JSON
     /// * `text` - Document content
-    /// * `embed_progress` - Optional callback invoked during embedding with chunk count
-    /// * `store_progress` - Optional callback invoked during database insertion with chunk count
     ///
     /// # Returns
     ///
@@ -35,35 +28,12 @@ impl DocumentDatabaseConnection {
     /// # Errors
     ///
     /// Returns an error if embedding or database insertion fails.
-    pub async fn insert_with_progress<F1, F2>(
-        &self,
-        metadata: serde_json::Value,
-        text: &str,
-        embed_progress: Option<F1>,
-        store_progress: Option<F2>,
-    ) -> Result<DocumentId>
-    where
-        F1: FnMut(usize),
-        F2: FnMut(usize),
-    {
-        let vecs = if embed_progress.is_some() {
-            self.embedder
-                .embed_document_with_progress(text, embed_progress)
-                .await?
-        } else {
-            self.embedder.embed_document(text).await?
-        };
-
-        let id = if store_progress.is_some() {
-            self.vconn
-                .insert_document_with_progress(text.as_ref(), metadata, vecs, store_progress)
-                .await?
-        } else {
-            self.vconn
-                .insert_document(text.as_ref(), metadata, vecs)
-                .await?
-        };
-
+    pub async fn insert(&self, metadata: serde_json::Value, text: &str) -> Result<DocumentId> {
+        let vecs = self.embedder.embed_document(text).await?;
+        let id = self
+            .vconn
+            .insert_document(text.as_ref(), metadata, vecs)
+            .await?;
         Ok(id)
     }
 

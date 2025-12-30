@@ -171,33 +171,9 @@ async fn add_document(path: PathBuf) -> Result<()> {
 
     println!("PROCESSING:");
     use std::cell::Cell;
-    use std::io::Write;
 
     let total_chunks = Cell::new(0);
-    let doc_id = conn
-        .insert_with_progress(
-            metadata,
-            &text,
-            Some(|count| {
-                total_chunks.set(count);
-                if count % 5 == 0 || count == 1 {
-                    let spinner_chars = ['|', '/', '-', '\\'];
-                    let spinner = spinner_chars[count % 4];
-                    print!("\r  EMBEDDING: {} CHUNKS {}", count, spinner);
-                    std::io::stdout().flush().unwrap();
-                }
-            }),
-            Some(|count| {
-                total_chunks.set(count);
-                if count % 5 == 0 || count == 1 {
-                    let spinner_chars = ['|', '/', '-', '\\'];
-                    let spinner = spinner_chars[count % 4];
-                    print!("\r  DATABASE: {} CHUNKS {}", count, spinner);
-                    std::io::stdout().flush().unwrap();
-                }
-            }),
-        )
-        .await?;
+    let doc_id = conn.insert(metadata, &text).await?;
 
     println!(
         "\r  DATABASE: {} CHUNKS - COMPLETE        ",
