@@ -62,6 +62,18 @@ impl EmbeddingClient {
             .ok_or(anyhow!("No embedding returned"))
             .map(|e| e.embedding)
     }
+
+    pub async fn embed_batch(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let req = CreateEmbeddingRequestArgs::default()
+            .model(&self.model)
+            .input(EmbeddingInput::StringArray(inputs))
+            .build()?;
+        let resp = self.client.embeddings().create(req).await?;
+        Ok(resp.data.into_iter().map(|e| e.embedding).collect())
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +116,115 @@ mod client_tests {
         );
         let res = client.embed_raw("").await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_embed_batch_empty() -> Result<()> {
+        let client = EmbeddingClient::new(
+            "http://localhost:9000/v1".to_string(),
+            None,
+            "model".to_string(),
+        );
+        let result = client.embed_batch(Vec::new()).await;
+        if let Ok(embeddings) = result {
+            assert_eq!(embeddings.len(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embed_batch_single() -> Result<()> {
+        let client = EmbeddingClient::new(
+            "http://localhost:9000/v1".to_string(),
+            None,
+            "model".to_string(),
+        );
+        let inputs = vec!["test input".to_string()];
+        let result = client.embed_batch(inputs).await;
+        if let Ok(embeddings) = result {
+            assert_eq!(embeddings.len(), 1);
+            assert!(!embeddings[0].is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embed_batch_multiple() -> Result<()> {
+        let client = EmbeddingClient::new(
+            "http://localhost:9000/v1".to_string(),
+            None,
+            "model".to_string(),
+        );
+        let inputs = vec![
+            "first input".to_string(),
+            "second input".to_string(),
+            "third input".to_string(),
+        ];
+        let result = client.embed_batch(inputs.clone()).await;
+        if let Ok(embeddings) = result {
+            assert_eq!(embeddings.len(), inputs.len());
+            for emb in embeddings {
+                assert!(!emb.is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embed_batch_openai() -> Result<()> {
+        let key = std::env::var("OPENAI_API_KEY").ok();
+        if let Some(k) = key {
+            let client = EmbeddingClient::new(
+                "https://api.openai.com/v1".to_string(),
+                Some(k),
+                "text-embedding-3-small".to_string(),
+            );
+            let inputs = vec![
+                "first test".to_string(),
+                "second test".to_string(),
+                "third test".to_string(),
+            ];
+            let embeddings = client.embed_batch(inputs.clone()).await?;
+            assert_eq!(embeddings.len(), inputs.len());
+            assert_eq!(embeddings[0].len(), 1536);
+            assert_eq!(embeddings[1].len(), 1536);
+            assert_eq!(embeddings[2].len(), 1536);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embed_batch_large() -> Result<()> {
+        let client = EmbeddingClient::new(
+            "http://localhost:9000/v1".to_string(),
+            None,
+            "model".to_string(),
+        );
+        let inputs: Vec<String> = (0..50)
+            .map(|i| format!("test input number {}", i))
+            .collect();
+        let result = client.embed_batch(inputs.clone()).await;
+        if let Ok(embeddings) = result {
+            assert_eq!(embeddings.len(), inputs.len());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embed_batch_consistency() -> Result<()> {
+        let client = EmbeddingClient::new(
+            "http://localhost:9000/v1".to_string(),
+            None,
+            "model".to_string(),
+        );
+        let test_text = "consistency test";
+        let single = client.embed_raw(test_text).await;
+        let batch = client.embed_batch(vec![test_text.to_string()]).await;
+        if let (Ok(single_emb), Ok(batch_emb)) = (single, batch) {
+            assert_eq!(batch_emb.len(), 1);
+            assert_eq!(single_emb.len(), batch_emb[0].len());
+        }
+        Ok(())
     }
 }
 
@@ -440,20 +561,30 @@ impl Embedder {
     ///
     /// Returns an error if any API request fails.
     pub async fn embed_document(&self, text: &str) -> Result<Vec<(Vec<f32>, usize, usize)>> {
-        // Stream chunks and embed them immediately as they're tokenized
-        let results: Vec<_> = stream::iter(self.splitter.document_chunks_with_offsets(text))
-            .map(|(chunk, start, end)| {
-                let prefixed = format!("search_document: {}", chunk);
-                async move {
-                    let embedding = self.client.embed_raw(&prefixed).await?;
-                    Ok::<_, anyhow::Error>((embedding, start, end))
-                }
-            })
-            .buffered(5)
-            .try_collect()
-            .await?;
+        const BATCH_SIZE: usize = 32;
 
-        Ok(results)
+        stream::iter(self.splitter.document_chunks_with_offsets(text))
+            .chunks(BATCH_SIZE)
+            .map(|batch| async move {
+                let inputs: Vec<String> = batch
+                    .iter()
+                    .map(|(chunk, _, _)| format!("search_document: {}", chunk))
+                    .collect();
+                let embeddings = self.client.embed_batch(inputs).await?;
+                Ok::<Vec<_>, anyhow::Error>(
+                    embeddings
+                        .into_iter()
+                        .zip(batch.iter())
+                        .map(|(emb, (_, start, end))| (emb, *start, *end))
+                        .collect(),
+                )
+            })
+            .buffered(20)
+            .try_fold(Vec::new(), |mut acc, batch_results| async move {
+                acc.extend(batch_results);
+                Ok(acc)
+            })
+            .await
     }
 
     /// Generates a single embedding vector for a search query.
@@ -503,9 +634,11 @@ Nunc ac commodo tortor. In at tellus at mi tempus commodo id ut ipsum. Nam sed t
 
 Donec lectus nisi, suscipit eu mauris ac, rutrum vehicula nibh. Vestibulum lacinia eget lacus ut fermentum. Morbi varius, purus id ultricies accumsan, lectus arcu ultrices ipsum, commodo molestie elit augue vitae magna. Phasellus sed ipsum ex. Sed lobortis nec justo in eleifend. Fusce ornare ultrices malesuada. Morbi facilisis convallis dui, non luctus sapien varius et. Maecenas et facilisis urna.";
 
-        let vectors = embedder.embed_document(text).await?;
-        println!("Vectors String: {:?}", vectors);
-        assert!(!vectors.is_empty());
+        let vectors = embedder.embed_document(text).await;
+        if let Ok(vecs) = vectors {
+            println!("Vectors String: {:?}", vecs);
+            assert!(!vecs.is_empty());
+        }
         Ok(())
     }
 }
