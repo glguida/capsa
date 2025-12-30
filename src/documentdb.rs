@@ -106,7 +106,7 @@ impl DocumentDatabase {
     /// Returns an error if the database cannot be initialized.
     pub async fn with_embedder(embedder: Embedder, vdb_path: String) -> Result<Self> {
         let embedder = Arc::new(embedder);
-        
+
         // Retrieve vector size by having a test query.
         let test_vec = embedder.embed_query("test").await?;
         let vec_size = test_vec.len();
@@ -126,9 +126,9 @@ impl DocumentDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use crate::embedder::Embedder;
     use crate::test_utils::MockEmbeddingClient;
+    use serde_json::json;
 
     async fn create_test_db(db_path: &str) -> Result<DocumentDatabase> {
         // Use mock client to avoid network dependencies

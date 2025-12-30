@@ -140,8 +140,8 @@ impl EmbedderClient for EmbeddingClient {
 #[cfg(test)]
 mod client_tests {
     use super::*;
-    use tokio;
     use crate::test_utils::MockEmbeddingClient;
+    use tokio;
 
     #[tokio::test]
     async fn test_mock_client() -> Result<()> {
@@ -629,9 +629,9 @@ impl Embedder {
     ) -> Result<Self> {
         let splitter = EmbeddingSplitter::new(&model, n_ctx)?;
         let client = EmbeddingClient::new(base_url, api_key, model);
-        Ok(Embedder { 
-            client: Box::new(client), 
-            splitter 
+        Ok(Embedder {
+            client: Box::new(client),
+            splitter,
         })
     }
 
