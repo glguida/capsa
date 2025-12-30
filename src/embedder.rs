@@ -188,25 +188,25 @@ mod client_tests {
             "third test".to_string(),
         ];
         let batch_embs = client.embed_batch(&inputs).await?;
-        
+
         // Verify correct number of embeddings
         assert_eq!(batch_embs.len(), 3);
-        
+
         // Verify each embedding has correct size
         for emb in &batch_embs {
             assert_eq!(emb.len(), 384);
         }
-        
+
         // Verify batch results match individual calls (deterministic)
         let single_emb1 = client.embed_raw(&inputs[0]).await?;
         let single_emb2 = client.embed_raw(&inputs[1]).await?;
         assert_eq!(batch_embs[0], single_emb1);
         assert_eq!(batch_embs[1], single_emb2);
-        
+
         // Verify different inputs produce different embeddings
         assert_ne!(batch_embs[0], batch_embs[1]);
         assert_ne!(batch_embs[1], batch_embs[2]);
-        
+
         Ok(())
     }
 
