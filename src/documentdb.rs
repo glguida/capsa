@@ -208,6 +208,8 @@ mod tests {
         Ok(())
     }
 
+    // Ignore this test. Requires an actual embedder.
+    #[ignore]
     #[tokio::test]
     async fn test_multiple_documents_ranking() -> Result<()> {
         let db = match create_test_db(":memory:").await {
