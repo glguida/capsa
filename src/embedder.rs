@@ -445,39 +445,7 @@ impl Embedder {
     ///
     /// Returns an error if any API request fails.
     pub async fn embed_document(&self, text: &str) -> Result<Vec<(Vec<f32>, usize, usize)>> {
-        self.embed_document_with_progress(text, None::<fn(usize)>)
-            .await
-    }
-
-    /// Generates embeddings for a document with progress callbacks.
-    ///
-    /// Works identically to `embed_document` but invokes an optional callback
-    /// after each chunk is embedded, passing the cumulative chunk count.
-    ///
-    /// # Arguments
-    ///
-    /// * `text` - The document text to embed
-    /// * `progress_callback` - Optional callback invoked with chunk count after each embedding
-    ///
-    /// # Returns
-    ///
-    /// A vector of tuples (embedding_vector, chunk_start, chunk_end), one per chunk.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any API request fails.
-    pub async fn embed_document_with_progress<F>(
-        &self,
-        text: &str,
-        mut progress_callback: Option<F>,
-    ) -> Result<Vec<(Vec<f32>, usize, usize)>>
-    where
-        F: FnMut(usize),
-    {
-        let mut chunk_count = 0;
-
         // Stream chunks and embed them immediately as they're tokenized
-        // This overlaps tokenization and API calls for better performance
         let results: Vec<_> = stream::iter(self.splitter.document_chunks_with_offsets(text))
             .map(|(chunk, start, end)| {
                 let prefixed = format!("search_document: {}", chunk);
@@ -487,12 +455,6 @@ impl Embedder {
                 }
             })
             .buffered(5)
-            .inspect(|_| {
-                chunk_count += 1;
-                if let Some(ref mut callback) = progress_callback {
-                    callback(chunk_count);
-                }
-            })
             .try_collect()
             .await?;
 
