@@ -38,10 +38,10 @@ pub mod test_utils {
 
             // Create a simple embedding vector
             let mut embedding = vec![0.0; self.embedding_size];
-            for i in 0..self.embedding_size {
+            for (i, item) in embedding.iter_mut().enumerate() {
                 // Use different parts of the hash for each dimension
                 let val = ((hash.wrapping_mul((i + 1) as u64)) % 1000) as f32 / 1000.0;
-                embedding[i] = val;
+                *item = val;
             }
 
             Ok(embedding)
