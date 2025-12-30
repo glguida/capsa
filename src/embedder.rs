@@ -99,46 +99,7 @@ impl EmbedderClient for EmbeddingClient {
 mod client_tests {
     use super::*;
     use tokio;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    /// Mock embedding client for testing.
-    /// 
-    /// Generates deterministic fake embeddings based on the input text hash.
-    /// This allows tests to run without requiring a real embedding server.
-    pub struct MockEmbeddingClient {
-        embedding_size: usize,
-    }
-
-    impl MockEmbeddingClient {
-        pub fn new(embedding_size: usize) -> Self {
-            Self { embedding_size }
-        }
-    }
-
-    #[async_trait]
-    impl EmbedderClient for MockEmbeddingClient {
-        async fn embed_raw(&self, input: &str) -> Result<Vec<f32>> {
-            if input.is_empty() {
-                return Err(anyhow!("Empty input not allowed"));
-            }
-            
-            // Generate a deterministic embedding based on input hash
-            let mut hasher = DefaultHasher::new();
-            input.hash(&mut hasher);
-            let hash = hasher.finish();
-            
-            // Create a simple embedding vector
-            let mut embedding = vec![0.0; self.embedding_size];
-            for i in 0..self.embedding_size {
-                // Use different parts of the hash for each dimension
-                let val = ((hash.wrapping_mul((i + 1) as u64)) % 1000) as f32 / 1000.0;
-                embedding[i] = val;
-            }
-            
-            Ok(embedding)
-        }
-    }
+    use crate::test_utils::MockEmbeddingClient;
 
     #[tokio::test]
     async fn test_mock_client() -> Result<()> {
@@ -146,7 +107,7 @@ mod client_tests {
         let emb1 = client.embed_raw("test").await?;
         let emb2 = client.embed_raw("test").await?;
         let emb3 = client.embed_raw("different").await?;
-        
+
         assert_eq!(emb1.len(), 384);
         assert_eq!(emb1, emb2); // Same input = same embedding
         assert_ne!(emb1, emb3); // Different input = different embedding
@@ -608,10 +569,10 @@ impl Embedder {
 #[cfg(test)]
 mod embedder_tests {
     use super::*;
-    use super::client_tests::MockEmbeddingClient;
+    use crate::test_utils::MockEmbeddingClient;
 
     /// Helper to create a mock embedder for testing without network dependencies.
-    /// 
+    ///
     /// Uses a simple tokenizer model that doesn't require downloading from HuggingFace.
     /// Note: This still requires the tokenizer to be available locally or cached.
     fn create_mock_embedder() -> Result<Embedder> {
