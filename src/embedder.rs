@@ -63,6 +63,25 @@ impl EmbeddingClient {
             .map(|e| e.embedding)
     }
 
+    /// Generates embedding vectors for a batch of text inputs.
+    ///
+    /// This method sends a single request to the embeddings API to generate
+    /// embeddings for multiple input strings at once.
+    ///
+    /// # Arguments
+    ///
+    /// * `inputs` - A list of text strings to embed. If empty, an empty
+    ///   vector is returned without making an API call.
+    ///
+    /// # Returns
+    ///
+    /// A vector of embedding vectors (`Vec<Vec<f32>>`), where each inner
+    /// vector corresponds to the embedding of the input at the same index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building the request fails, the API request
+    /// fails, or if the response cannot be processed.
     pub async fn embed_batch(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
