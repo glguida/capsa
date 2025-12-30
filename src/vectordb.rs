@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database};
 use serde_json::Value;
+use std::sync::Arc;
 
-#[derive(Clone)]
 struct VectorDatabaseSchema {
     create_documents_table: String,
     create_vectors_table: String,
@@ -92,12 +92,12 @@ impl VectorDatabaseSchema {
 
 pub struct VectorDatabaseConnection {
     conn: Connection,
-    schema: VectorDatabaseSchema,
+    schema: Arc<VectorDatabaseSchema>,
 }
 
 impl VectorDatabaseConnection {
     /// Initialize the database and create the schema
-    async fn new(conn: Connection, schema: VectorDatabaseSchema) -> Result<Self> {
+    async fn new(conn: Connection, schema: Arc<VectorDatabaseSchema>) -> Result<Self> {
         // Enable foreign keys for the ON DELETE CASCADE behavior
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
 
@@ -210,7 +210,7 @@ impl VectorDatabaseConnection {
         query_vector: Vec<f32>,
         limit: usize,
     ) -> Result<Vec<(i64, Value, i64, i64)>> {
-        let vec_str = format!("{:?}", query_vector);
+        let vec_str = serde_json::to_string(&query_vector)?;
 
         let mut rows = self
             .conn
@@ -238,7 +238,7 @@ impl VectorDatabaseConnection {
         query_vector: Vec<f32>,
         limit: usize,
     ) -> Result<Vec<(i64, Value, f32, i64, i64)>> {
-        let vec_str = format!("{:?}", query_vector);
+        let vec_str = serde_json::to_string(&query_vector)?;
 
         let mut rows = self
             .conn
@@ -276,7 +276,7 @@ impl VectorDatabaseConnection {
         query_vector: Vec<f32>,
         limit: usize,
     ) -> Result<Vec<(i64, Value, Vec<f32>, i64, i64)>> {
-        let vec_str = format!("{:?}", query_vector);
+        let vec_str = serde_json::to_string(&query_vector)?;
 
         let mut rows = self
             .conn
@@ -329,13 +329,13 @@ impl VectorDatabaseConnection {
 
 pub struct VectorDatabase {
     db: Database,
-    schema: VectorDatabaseSchema,
+    schema: Arc<VectorDatabaseSchema>,
 }
 
 impl VectorDatabase {
     pub async fn new(db_path: &str, vec_size: usize) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
-        let schema = VectorDatabaseSchema::new(vec_size);
+        let schema = Arc::new(VectorDatabaseSchema::new(vec_size));
         Ok(VectorDatabase { db, schema })
     }
 
