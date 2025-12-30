@@ -31,6 +31,22 @@ pub trait EmbedderClient: Send + Sync {
     ///
     /// Returns an error if the embedding generation fails.
     async fn embed_raw(&self, input: &str) -> Result<Vec<f32>>;
+
+    /// Generates embedding vectors for multiple text inputs in a single batch.
+    ///
+    /// # Arguments
+    ///
+    /// * `inputs` - A vector of text strings to embed
+    ///
+    /// # Returns
+    ///
+    /// A vector of embedding vectors (`Vec<Vec<f32>>`), where each inner
+    /// vector corresponds to the embedding of the input at the same index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the embedding generation fails.
+    async fn embed_batch(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>>;
 }
 
 /// Client for making embedding requests to OpenAI-compatible APIs.
@@ -76,7 +92,7 @@ impl EmbedderClient for EmbeddingClient {
     /// # Errors
     ///
     /// Returns an error if the API request fails or no embedding is returned.
-    pub async fn embed_raw(&self, input: &str) -> Result<Vec<f32>> {
+    async fn embed_raw(&self, input: &str) -> Result<Vec<f32>> {
         let req = CreateEmbeddingRequestArgs::default()
             .model(&self.model)
             .input(EmbeddingInput::String(input.into()))
@@ -108,7 +124,7 @@ impl EmbedderClient for EmbeddingClient {
     ///
     /// Returns an error if building the request fails, the API request
     /// fails, or if the response cannot be processed.
-    pub async fn embed_batch(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    async fn embed_batch(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
@@ -635,10 +651,10 @@ impl Embedder {
     /// Returns an error if the tokenizer for the model cannot be loaded.
     pub fn with_client(
         client: Box<dyn EmbedderClient>,
-        model: &str,
+        model: String,
         n_ctx: usize,
     ) -> Result<Self> {
-        let splitter = EmbeddingSplitter::new(model, n_ctx)?;
+        let splitter = EmbeddingSplitter::new(&model, n_ctx)?;
         Ok(Embedder { client, splitter })
     }
 
@@ -723,7 +739,7 @@ mod embedder_tests {
     fn create_mock_embedder() -> Result<Embedder> {
         let client = Box::new(MockEmbeddingClient::new(384));
         // Use bert-base-uncased as it's commonly cached
-        Embedder::with_client(client, "bert-base-uncased", 512)
+        Embedder::with_client(client, "bert-base-uncased".to_string(), 512)
     }
 
     #[tokio::test]

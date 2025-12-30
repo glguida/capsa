@@ -134,7 +134,7 @@ mod tests {
         // Use mock client to avoid network dependencies
         let client = Box::new(MockEmbeddingClient::new(384));
         // Skip test if tokenizer is unavailable (no network/cache)
-        let embedder = match Embedder::with_client(client, "bert-base-uncased", 512) {
+        let embedder = match Embedder::with_client(client, "bert-base-uncased".to_string(), 512) {
             Ok(e) => e,
             Err(_) => return Err(anyhow::anyhow!("Tokenizer unavailable")),
         };

@@ -46,6 +46,15 @@ pub mod test_utils {
 
             Ok(embedding)
         }
+
+        async fn embed_batch(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            let mut embeddings = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                let embedding = self.embed_raw(&input).await?;
+                embeddings.push(embedding);
+            }
+            Ok(embeddings)
+        }
     }
 }
 
