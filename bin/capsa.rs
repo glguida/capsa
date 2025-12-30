@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use capsa::documentdb::DocumentDatabase;
 use clap::{Parser, Subcommand};
+use lru::LruCache;
 use serde_json::json;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -223,6 +225,8 @@ async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<(
         if results.is_empty() {
             println!("*** NO RECORDS FOUND ***");
         } else {
+            let mut doc_cache: LruCache<i64, String> =
+                LruCache::new(NonZeroUsize::new(64).unwrap());
             for (idx, (doc_id, metadata, distance, chunk_start, chunk_end)) in
                 results.iter().enumerate()
             {
@@ -267,8 +271,12 @@ async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<(
                     chunk_end - chunk_start
                 );
 
-                // Fetch document and show excerpt
-                if let Ok(Some((content, _))) = conn.fetch_document(*doc_id).await {
+                if !doc_cache.contains(doc_id)
+                    && let Ok(Some((content, _))) = conn.fetch_document(*doc_id).await
+                {
+                    doc_cache.put(*doc_id, content);
+                }
+                if let Some(content) = doc_cache.get(doc_id) {
                     let start = *chunk_start as usize;
                     let end = *chunk_end as usize;
                     if end <= content.len() {
@@ -296,6 +304,8 @@ async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<(
         if results.is_empty() {
             println!("*** NO RECORDS FOUND ***");
         } else {
+            let mut doc_cache: LruCache<i64, String> =
+                LruCache::new(NonZeroUsize::new(64).unwrap());
             for (idx, (doc_id, metadata, chunk_start, chunk_end)) in results.iter().enumerate() {
                 println!(
                     "================================================================================"
@@ -331,8 +341,12 @@ async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<(
                     chunk_end - chunk_start
                 );
 
-                // Fetch document and show excerpt
-                if let Ok(Some((content, _))) = conn.fetch_document(*doc_id).await {
+                if !doc_cache.contains(doc_id)
+                    && let Ok(Some((content, _))) = conn.fetch_document(*doc_id).await
+                {
+                    doc_cache.put(*doc_id, content);
+                }
+                if let Some(content) = doc_cache.get(doc_id) {
                     let start = *chunk_start as usize;
                     let end = *chunk_end as usize;
                     if end <= content.len() {
