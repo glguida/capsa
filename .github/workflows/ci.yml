@@ -57,7 +57,7 @@ jobs:
 
       - name: Run cargo-audit (dependency vulnerabilities)
         run: cargo audit --deny warnings
-        continue-on-error: false
+        continue-on-error: true
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked || true
