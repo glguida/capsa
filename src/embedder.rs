@@ -15,8 +15,7 @@ use async_openai::{
 /// This client handles authentication and communication with embedding services
 /// that implement the OpenAI embeddings API format.
 pub struct EmbeddingClient {
-    base_url: String,
-    api_key: Option<String>,
+    client: Client<OpenAIConfig>,
     model: String,
 }
 
@@ -29,11 +28,13 @@ impl EmbeddingClient {
     /// * `api_key` - Optional API key for authentication
     /// * `model` - Name of the embedding model to use
     pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
-        Self {
-            base_url,
-            api_key,
-            model,
+        let mut config = OpenAIConfig::default();
+        if let Some(key) = api_key {
+            config = config.with_api_key(key);
         }
+        config = config.with_api_base(&base_url);
+        let client = Client::with_config(config);
+        Self { client, model }
     }
 
     /// Generates an embedding vector for the given text input.
@@ -50,17 +51,11 @@ impl EmbeddingClient {
     ///
     /// Returns an error if the API request fails or no embedding is returned.
     pub async fn embed_raw(&self, input: &str) -> Result<Vec<f32>> {
-        let mut config = OpenAIConfig::default();
-        if let Some(ref key) = self.api_key {
-            config = config.with_api_key(key);
-        }
-        config = config.with_api_base(&self.base_url);
-        let client = Client::with_config(config);
         let req = CreateEmbeddingRequestArgs::default()
             .model(&self.model)
             .input(EmbeddingInput::String(input.into()))
             .build()?;
-        let resp = client.embeddings().create(req).await?;
+        let resp = self.client.embeddings().create(req).await?;
         resp.data
             .into_iter()
             .next()
