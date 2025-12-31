@@ -23,14 +23,22 @@ This allows finding relevant content based on semantic meaning rather than exact
 
 Capsa requires an embedding service with an OpenAI-compatible API. You have several options:
 
-**Option 1: llama.cpp** (lightweight, runs on CPU, recommended for local use)
+**Option 1: llama.cpp**
 ```bash
 llama-server -m /path/to/nomic-embed-text-v1.5.Q4_K_M.gguf --embeddings --port 9000
 ```
 
-**Option 2: text-embeddings-inference** (requires CUDA/GPU)
+**Option 2: text-embeddings-inference**
+
+For GPU/CUDA support:
 ```bash
 docker run -p 9000:80 ghcr.io/huggingface/text-embeddings-inference:latest \
+  --model-id nomic-ai/nomic-embed-text-v1.5
+```
+
+For CPU only support:
+```bash
+docker run -p 9000:80 ghcr.io/huggingface/text-embeddings-inference:cpu-latest \
   --model-id nomic-ai/nomic-embed-text-v1.5
 ```
 
