@@ -3,7 +3,7 @@
 //! This library provides functionality to create embeddings from text documents,
 //! handling text splitting, chunking, and parallel processing of large documents.
 
-use anyhow::{Result, anyhow};
+use crate::error::{EmbeddingError, Result};
 use async_openai::{
     Client,
     config::OpenAIConfig,
@@ -97,11 +97,16 @@ impl EmbeddingInterface for OAIEmbedding {
             .model(&self.model)
             .input(EmbeddingInput::String(input.into()))
             .build()?;
-        let resp = self.client.embeddings().create(req).await?;
+        let resp = self
+            .client
+            .embeddings()
+            .create(req)
+            .await
+            .map_err(EmbeddingError::ApiError)?;
         resp.data
             .into_iter()
             .next()
-            .ok_or(anyhow!("No embedding returned"))
+            .ok_or_else(|| EmbeddingError::NoEmbeddingReturned.into())
             .map(|e| e.embedding)
     }
 
@@ -132,7 +137,12 @@ impl EmbeddingInterface for OAIEmbedding {
             .model(&self.model)
             .input(EmbeddingInput::StringArray(inputs.to_vec()))
             .build()?;
-        let resp = self.client.embeddings().create(req).await?;
+        let resp = self
+            .client
+            .embeddings()
+            .create(req)
+            .await
+            .map_err(EmbeddingError::ApiError)?;
         Ok(resp.data.into_iter().map(|e| e.embedding).collect())
     }
 }
@@ -341,7 +351,7 @@ impl EmbeddingSplitter {
     ) -> Result<TextSplitter<Tokenizer>> {
         let prefix_len = tokenizer
             .encode(prefix, true)
-            .map_err(|e| anyhow!("Failed to tokenize: {}", e))?
+            .map_err(|e| EmbeddingError::TokenizationFailed(e.to_string()))?
             .get_ids()
             .len();
         let chunk_len = n_ctx - prefix_len;
@@ -368,8 +378,11 @@ impl EmbeddingSplitter {
     /// Returns an error if the tokenizer cannot be loaded.
     pub fn new(model: &str, n_ctx: usize) -> Result<Self> {
         let overlap = 0.05; /* 5% overlap */
-        let tokenizer = Tokenizer::from_pretrained(model, None)
-            .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
+        let tokenizer =
+            Tokenizer::from_pretrained(model, None).map_err(|e| EmbeddingError::TokenizerLoad {
+                model: model.to_string(),
+                message: e.to_string(),
+            })?;
         let query_splitter =
             Self::create_splitter(n_ctx, "search_query: ", tokenizer.clone(), overlap)?;
         let document_splitter =
@@ -484,7 +497,7 @@ mod splitter_tests {
         let full = format!("{}{}", p, tr);
         let enc = t
             .encode(full.as_str(), true)
-            .map_err(|_| anyhow!("Failed!"))?;
+            .map_err(|e| EmbeddingError::TokenizationFailed(e.to_string()))?;
         let l = enc.get_ids().len();
         assert!(l <= n);
         Ok(())
@@ -535,7 +548,7 @@ mod splitter_tests {
         let p = "search_document: ";
         let pl = t
             .encode(p, true)
-            .map_err(|_| anyhow!("Failed!"))?
+            .map_err(|e| EmbeddingError::TokenizationFailed(e.to_string()))?
             .get_ids()
             .len();
         let cl = n - pl;
@@ -547,7 +560,7 @@ mod splitter_tests {
             let full = format!("{}{}", p, *c);
             let enc = t
                 .encode(full.as_str(), true)
-                .map_err(|_| anyhow!("Failed!"))?;
+                .map_err(|e| EmbeddingError::TokenizationFailed(e.to_string()))?;
             assert!(enc.get_ids().len() <= n);
         }
         for w in ch.windows(2) {
@@ -562,7 +575,9 @@ mod splitter_tests {
             }
             assert!(overlap_chars > 0);
             let o_txt = &a[a.len() - overlap_chars..];
-            let enc_o = t.encode(o_txt, false).map_err(|_| anyhow!("Failed!"))?;
+            let enc_o = t
+                .encode(o_txt, false)
+                .map_err(|e| EmbeddingError::TokenizationFailed(e.to_string()))?;
             let o_len = enc_o.get_ids().len();
             assert!((o_len as i32 - ol as i32).abs() <= 10); /* allow variance */
         }
@@ -718,7 +733,7 @@ impl Embedder {
                     .map(|(chunk, _, _)| format!("search_document: {}", chunk))
                     .collect();
                 let embeddings = self.client.embed_batch(&inputs).await?;
-                Ok::<Vec<_>, anyhow::Error>(
+                Ok::<Vec<_>, crate::error::CapsaError>(
                     embeddings
                         .into_iter()
                         .zip(batch.iter())

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use crate::error::{DatabaseError, Result};
 use libsql::{Builder, Connection, Database};
 use serde_json::Value;
 use std::sync::Arc;
@@ -175,7 +175,10 @@ impl VectorDatabaseConnection {
                 )
                 .await?;
 
-            rows.next().await?.context("Insert failed")?.get(0)?
+            rows.next()
+                .await?
+                .ok_or_else(|| DatabaseError::InsertFailed("No ID returned".to_string()))?
+                .get(0)?
         };
 
         // 2. Insert Vectors with offsets in same transaction
@@ -363,9 +366,7 @@ mod db_tests {
     async fn test_full_flow() -> Result<()> {
         // 1. Initialize an in-memory database
         // ":memory:" ensures no files are created on disk during testing
-        let db = VectorDatabase::new(":memory:", 3)
-            .await
-            .context("Failed to init memory db")?;
+        let db = VectorDatabase::new(":memory:", 3).await?;
         let conn = db.connect().await?;
 
         // 2. Prepare mock data
@@ -380,17 +381,13 @@ mod db_tests {
         // 3. Test Insertion
         let doc_id = conn
             .insert_document(content, metadata.clone(), embeddings)
-            .await
-            .context("Insertion failed")?;
+            .await?;
         assert!(doc_id > 0);
 
         // 4. Test Search
         // Querying with something very similar to our [1.0, 0.0, 0.0]
         let query_vec = vec![0.9, 0.1, 0.0];
-        let results = conn
-            .search_topk_with_distance(query_vec, 1)
-            .await
-            .context("Search failed")?;
+        let results = conn.search_topk_with_distance(query_vec, 1).await?;
 
         assert_eq!(results.len(), 1);
         let (found_doc_id, found_meta, distance, _, _) = &results[0];

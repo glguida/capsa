@@ -1,7 +1,7 @@
 use crate::config::{Config, EMBEDDING_CONTEXT};
 use crate::embedder::Embedder;
+use crate::error::Result;
 use crate::vectordb::{VectorDatabase, VectorDatabaseConnection};
-use anyhow::Result;
 use std::sync::Arc;
 
 type DocumentId = i64;
@@ -142,7 +142,7 @@ mod tests {
         // Skip test if tokenizer is unavailable (no network/cache)
         let embedder = match Embedder::with_client(client, "bert-base-uncased".to_string(), 512) {
             Ok(e) => e,
-            Err(_) => return Err(anyhow::anyhow!("Tokenizer unavailable")),
+            Err(e) => return Err(e),
         };
         DocumentDatabase::with_embedder(embedder, db_path.to_string()).await
     }

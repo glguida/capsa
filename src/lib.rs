@@ -1,12 +1,13 @@
 pub mod config;
 pub mod documentdb;
 pub mod embedder;
+pub mod error;
 pub mod vectordb;
 
 #[cfg(test)]
 pub mod test_utils {
     use crate::embedder::EmbeddingInterface;
-    use anyhow::Result;
+    use crate::error::{EmbeddingError, Result};
     use async_trait::async_trait;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -29,7 +30,9 @@ pub mod test_utils {
     impl EmbeddingInterface for MockEmbedding {
         async fn embed_raw(&self, input: &str) -> Result<Vec<f32>> {
             if input.is_empty() {
-                return Err(anyhow::anyhow!("Empty input not allowed"));
+                return Err(
+                    EmbeddingError::InvalidInput("Empty input not allowed".to_string()).into(),
+                );
             }
 
             // Generate a deterministic embedding based on input hash
