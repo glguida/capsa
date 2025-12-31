@@ -1,5 +1,7 @@
 //! Configuration constants for the embedding system.
 
+use secrecy::SecretString;
+
 /// The maximum context size in tokens for text embeddings.
 ///
 /// This value is fixed at 128 tokens, which has been empirically determined
@@ -7,7 +9,8 @@
 pub const EMBEDDING_CONTEXT: usize = 128;
 
 /// Runtime configuration for the embedding system.
-#[derive(Clone)]
+#[non_exhaustive]
+#[derive(Clone, Debug)]
 pub struct Config {
     /// Base URL for the embedding API endpoint
     pub base_url: String,
@@ -16,7 +19,7 @@ pub struct Config {
     /// Path to the vector database file
     pub db_path: String,
     /// Optional API key for authentication
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
 }
 
 impl Config {
@@ -28,7 +31,12 @@ impl Config {
     /// * `model` - Name of the embedding model to use
     /// * `db_path` - Path to the vector database file
     /// * `api_key` - Optional API key for authentication
-    pub fn new(base_url: String, model: String, db_path: String, api_key: Option<String>) -> Self {
+    pub fn new(
+        base_url: String,
+        model: String,
+        db_path: String,
+        api_key: Option<SecretString>,
+    ) -> Self {
         Config {
             base_url,
             model,
@@ -38,20 +46,10 @@ impl Config {
     }
 }
 
-impl std::fmt::Debug for Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Config")
-            .field("base_url", &self.base_url)
-            .field("model", &self.model)
-            .field("db_path", &self.db_path)
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
     #[test]
     fn test_config_debug_redacts_api_key() {
@@ -60,7 +58,7 @@ mod tests {
             "http://localhost:9000".to_string(),
             "test-model".to_string(),
             "./test.db".to_string(),
-            Some("super-secret-api-key-12345".to_string()),
+            Some(SecretString::from("super-secret-api-key-12345")),
         );
 
         let debug_output = format!("{:?}", config_with_key);
@@ -108,7 +106,7 @@ mod tests {
             "http://localhost:9000".to_string(),
             "test-model".to_string(),
             "./test.db".to_string(),
-            Some("api-key".to_string()),
+            Some(SecretString::from("api-key")),
         );
 
         let cloned = original.clone();
@@ -116,6 +114,9 @@ mod tests {
         assert_eq!(original.base_url, cloned.base_url);
         assert_eq!(original.model, cloned.model);
         assert_eq!(original.db_path, cloned.db_path);
-        assert_eq!(original.api_key, cloned.api_key);
+        assert_eq!(
+            original.api_key.as_ref().map(|s| s.expose_secret()),
+            cloned.api_key.as_ref().map(|s| s.expose_secret())
+        );
     }
 }

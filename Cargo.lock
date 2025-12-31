@@ -391,6 +391,7 @@ dependencies = [
  "libsql",
  "lru",
  "pdf-extract",
+ "secrecy",
  "serde_json",
  "stream",
  "text-splitter",

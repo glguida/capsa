@@ -10,13 +10,14 @@ use async_openai::{
     types::embeddings::{CreateEmbeddingRequestArgs, EmbeddingInput},
 };
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretString};
 
 /// Trait defining the interface for embedding implementations.
 ///
 /// This trait allows for different implementations of embedding services,
 /// including real API clients and mock implementations for testing.
 #[async_trait]
-pub trait EmbeddingInterface: Send + Sync {
+pub trait EmbeddingInterface: Send + Sync + std::fmt::Debug {
     /// Generates an embedding vector for the given text input.
     ///
     /// # Arguments
@@ -53,6 +54,7 @@ pub trait EmbeddingInterface: Send + Sync {
 ///
 /// This client handles authentication and communication with embedding services
 /// that implement the OpenAI embeddings API format.
+#[derive(Debug)]
 pub struct OAIEmbedding {
     client: Client<OpenAIConfig>,
     model: String,
@@ -66,10 +68,10 @@ impl OAIEmbedding {
     /// * `base_url` - The base URL of the embeddings API endpoint
     /// * `api_key` - Optional API key for authentication
     /// * `model` - Name of the embedding model to use
-    pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
+    pub fn new(base_url: String, api_key: Option<SecretString>, model: String) -> Self {
         let mut config = OpenAIConfig::default();
         if let Some(key) = api_key {
-            config = config.with_api_key(key);
+            config = config.with_api_key(key.expose_secret());
         }
         config = config.with_api_base(&base_url);
         let client = Client::with_config(config);
@@ -168,7 +170,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_embed_client_openai() -> Result<()> {
-        let key = std::env::var("OPENAI_API_KEY").ok();
+        let key = std::env::var("OPENAI_API_KEY").ok().map(SecretString::from);
         if let Some(k) = key {
             let client = OAIEmbedding::new(
                 "https://api.openai.com/v1".to_string(),
@@ -274,7 +276,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_embed_batch_openai() -> Result<()> {
-        let key = std::env::var("OPENAI_API_KEY").ok();
+        let key = std::env::var("OPENAI_API_KEY").ok().map(SecretString::from);
         if let Some(k) = key {
             let client = OAIEmbedding::new(
                 "https://api.openai.com/v1".to_string(),
@@ -337,6 +339,7 @@ use tokenizers::tokenizer::Tokenizer;
 ///
 /// This splitter manages token limits and overlap for both queries and documents,
 /// ensuring text fits within the model's context window.
+#[derive(Debug)]
 pub struct EmbeddingSplitter {
     query_splitter: TextSplitter<Tokenizer>,
     document_splitter: TextSplitter<Tokenizer>,
@@ -649,6 +652,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 ///
 /// Combines an embedding implementation with text splitting to handle documents
 /// of any size, automatically chunking and processing them in parallel.
+#[derive(Debug)]
 pub struct Embedder {
     client: Box<dyn EmbeddingInterface>,
     splitter: EmbeddingSplitter,
@@ -670,7 +674,7 @@ impl Embedder {
     pub fn new(
         base_url: String,
         model: String,
-        api_key: Option<String>,
+        api_key: Option<SecretString>,
         n_ctx: usize,
     ) -> Result<Self> {
         let splitter = EmbeddingSplitter::new(&model, n_ctx)?;

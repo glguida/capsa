@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 type DocumentId = i64;
 
+#[derive(Debug)]
 pub struct DocumentDatabaseConnection {
     embedder: Arc<Embedder>,
     vconn: VectorDatabaseConnection,
@@ -164,6 +165,7 @@ impl DocumentDatabaseConnection {
     }
 }
 
+#[derive(Debug)]
 pub struct DocumentDatabase {
     embedder: Arc<Embedder>,
     vdb: VectorDatabase,

@@ -487,7 +487,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize global configuration
-    let api_key = std::env::var("EMB_API_KEY").ok();
+    let api_key = std::env::var("CAPSA_API_KEY")
+        .ok()
+        .map(secrecy::SecretString::from);
     CONFIG.get_or_init(|| Config::new(cli.base_url, cli.model, cli.db_path, api_key));
 
     match cli.command {
