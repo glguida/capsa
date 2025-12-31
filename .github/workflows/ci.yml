@@ -44,6 +44,12 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Security audit (cargo audit)
+        run: cargo audit
+        continue-on-error: true
   docs:
     name: Build docs and upload artifact
     runs-on: ubuntu-latest
