@@ -116,7 +116,7 @@ impl From<text_splitter::ChunkConfigError> for CapsaError {
 
 impl From<async_openai::error::OpenAIError> for CapsaError {
     fn from(err: async_openai::error::OpenAIError) -> Self {
-        CapsaError::Embedding(EmbeddingError::RequestBuild(err))
+        CapsaError::Embedding(EmbeddingError::ApiError(err))
     }
 }
 
