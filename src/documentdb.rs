@@ -127,12 +127,12 @@ impl DocumentDatabase {
 mod tests {
     use super::*;
     use crate::embedder::Embedder;
-    use crate::test_utils::MockEmbeddingClient;
+    use crate::test_utils::MockEmbedding;
     use serde_json::json;
 
     async fn create_test_db(db_path: &str) -> Result<DocumentDatabase> {
         // Use mock client to avoid network dependencies
-        let client = Box::new(MockEmbeddingClient::new(384));
+        let client = Box::new(MockEmbedding::new(384));
         // Skip test if tokenizer is unavailable (no network/cache)
         let embedder = match Embedder::with_client(client, "bert-base-uncased".to_string(), 512) {
             Ok(e) => e,
