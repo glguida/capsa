@@ -1,7 +1,15 @@
 [package]
 name = "capsa"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
+authors = ["Gianluca Guida <glguida@gmail.com>"]
+description = "A compact, lightweight library for embedding-based document storage and retrieval"
+license = "MIT"
+repository = "https://github.com/glguida/capsa"
+homepage = "https://github.com/glguida/capsa"
+keywords = ["vector-search", "embeddings", "rag", "retrieval", "semantic-search"]
+categories = ["database", "text-processing"]
+readme = "README.md"
 
 [[bin]]
 name = "capsa"

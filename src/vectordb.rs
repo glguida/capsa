@@ -1,3 +1,12 @@
+//! Low-level vector database operations using libSQL.
+//!
+//! This module provides direct access to vector storage and similarity search
+//! functionality. It manages document storage, embedding vectors, and vector
+//! indices using libSQL's native vector support.
+//!
+//! For most use cases, prefer the higher-level [`documentdb`](crate::documentdb)
+//! module which handles embedding generation automatically.
+
 use crate::error::{DatabaseError, Result};
 use libsql::{Builder, Connection, Database};
 use serde_json::Value;
@@ -96,7 +105,10 @@ pub struct VectorDatabaseConnection {
 }
 
 impl VectorDatabaseConnection {
-    /// Initialize the database and create the schema
+    /// Creates a new vector database connection and initializes the schema.
+    ///
+    /// This sets up the necessary tables and indices for vector storage if they
+    /// do not already exist.
     async fn new(conn: Connection, schema: Arc<VectorDatabaseSchema>) -> Result<Self> {
         // Enable foreign keys for the ON DELETE CASCADE behavior
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
@@ -126,7 +138,21 @@ impl VectorDatabaseConnection {
         Ok(())
     }
 
-    /// Store a document and its multiple embeddings with chunk offsets
+    /// Stores a document with its embeddings and chunk offsets.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The full document text
+    /// * `metadata` - Document metadata as JSON
+    /// * `embeddings` - Vector of (embedding, chunk_start, chunk_end) tuples
+    ///
+    /// # Returns
+    ///
+    /// The assigned document ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if database insertion fails.
     pub async fn insert_document(
         &self,
         content: &str,
@@ -137,18 +163,21 @@ impl VectorDatabaseConnection {
             .await
     }
 
-    /// Store a document with progress callbacks during database insertion.
+    /// Stores a document with progress tracking during database insertion.
+    ///
+    /// Similar to [`insert_document`](Self::insert_document), but invokes a callback
+    /// after each chunk is inserted, useful for displaying progress to users.
     ///
     /// # Arguments
     ///
-    /// * `content` - The document content
+    /// * `content` - The full document text
     /// * `metadata` - Document metadata as JSON
-    /// * `embeddings` - Vector of (embedding, start_offset, end_offset) tuples
-    /// * `progress_callback` - Optional callback invoked with chunk count after each vector insert
+    /// * `embeddings` - Vector of (embedding, chunk_start, chunk_end) tuples
+    /// * `progress_callback` - Optional callback invoked with cumulative chunk count
     ///
     /// # Returns
     ///
-    /// The document ID assigned by the database.
+    /// The assigned document ID.
     ///
     /// # Errors
     ///
@@ -206,8 +235,21 @@ impl VectorDatabaseConnection {
         Ok(doc_id)
     }
 
-    /// Search for top-k most similar document chunks
-    /// Returns: (doc_id, metadata, chunk_start, chunk_end)
+    /// Searches for the top-k most similar document chunks using vector similarity.
+    ///
+    /// # Arguments
+    ///
+    /// * `query_vector` - The embedded query vector
+    /// * `limit` - Maximum number of results to return
+    ///
+    /// # Returns
+    ///
+    /// A vector of tuples containing (doc_id, metadata, chunk_start, chunk_end)
+    /// ordered by cosine similarity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub async fn search_topk(
         &self,
         query_vector: Vec<f32>,
@@ -234,8 +276,21 @@ impl VectorDatabaseConnection {
         Ok(results)
     }
 
-    /// Search for top-k most similar document chunks with distances
-    /// Returns: (doc_id, metadata, distance, chunk_start, chunk_end)
+    /// Searches for the top-k most similar document chunks with cosine distances.
+    ///
+    /// # Arguments
+    ///
+    /// * `query_vector` - The embedded query vector
+    /// * `limit` - Maximum number of results to return
+    ///
+    /// # Returns
+    ///
+    /// A vector of tuples containing (doc_id, metadata, distance, chunk_start, chunk_end).
+    /// Lower distances indicate higher similarity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub async fn search_topk_with_distance(
         &self,
         query_vector: Vec<f32>,
@@ -272,8 +327,20 @@ impl VectorDatabaseConnection {
         Ok(results)
     }
 
-    /// Search for top-k most similar document chunks with embedding vectors
-    /// Returns: (doc_id, metadata, embedding_vector, chunk_start, chunk_end)
+    /// Searches for the top-k most similar document chunks, including their embedding vectors.
+    ///
+    /// # Arguments
+    ///
+    /// * `query_vector` - The embedded query vector
+    /// * `limit` - Maximum number of results to return
+    ///
+    /// # Returns
+    ///
+    /// A vector of tuples containing (doc_id, metadata, embedding_vector, chunk_start, chunk_end).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub async fn search_topk_with_vectors(
         &self,
         query_vector: Vec<f32>,
@@ -311,8 +378,19 @@ impl VectorDatabaseConnection {
         Ok(results)
     }
 
-    /// Fetch document by ID
-    /// Returns: (content, metadata)
+    /// Retrieves a document by its ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `doc_id` - The document ID to retrieve
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some((content, metadata))` if found, or `None` if the document does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub async fn fetch_document(&self, doc_id: i64) -> Result<Option<(String, Value)>> {
         let mut rows = self
             .conn
@@ -336,12 +414,29 @@ pub struct VectorDatabase {
 }
 
 impl VectorDatabase {
+    /// Creates a new vector database at the specified path.
+    ///
+    /// # Arguments
+    ///
+    /// * `db_path` - Path to the database file, or ":memory:" for in-memory database
+    /// * `vec_size` - Dimensionality of the embedding vectors
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be created or opened.
     pub async fn new(db_path: &str, vec_size: usize) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
         let schema = Arc::new(VectorDatabaseSchema::new(vec_size));
         Ok(VectorDatabase { db, schema })
     }
 
+    /// Creates a new connection to the vector database.
+    ///
+    /// Multiple connections can share the same database for concurrent access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection cannot be established.
     pub async fn connect(&self) -> Result<VectorDatabaseConnection> {
         let conn = self.db.connect()?;
         VectorDatabaseConnection::new(conn, self.schema.clone()).await

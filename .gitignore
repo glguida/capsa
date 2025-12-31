@@ -1,4 +1,7 @@
 /target
 *~
 *#*#
+*.db
+*.pdf
+*.png
 

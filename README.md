@@ -2,9 +2,11 @@
 
 [![CI](https://github.com/glguida/capsa/actions/workflows/ci.yml/badge.svg)](https://github.com/glguida/capsa/actions/workflows/ci.yml)
 
-**A vector database CLI for semantic document search, written in Rust.**
+**A compact, lightweight library for embedding-based document storage and retrieval.**
 
-Capsa implements the retrieval component of RAG (Retrieval-Augmented Generation) systems. It ingests documents, generates embeddings, stores them in a vector database, and enables semantic search through natural language queries.
+Capsa is a Rust library that implements the retrieval component of RAG (Retrieval-Augmented Generation) systems. It provides a simple API for ingesting documents, generating embeddings, storing them in a vector database, and performing semantic search through natural language queries.
+
+The repository also includes a fully-functional CLI tool for document indexing and semantic search.
 
 ## How It Works
 
@@ -17,7 +19,65 @@ Capsa uses a standard vector database approach:
 
 This allows finding relevant content based on semantic meaning rather than exact keyword matches.
 
-## Quick Start
+## Library Usage
+
+Add Capsa to your `Cargo.toml`:
+
+```toml
+[dependencies]
+capsa = "0.1"
+```
+
+### Example
+
+```rust
+use capsa::{config::Config, documentdb::DocumentDatabase};
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Configure the embedding service and database
+    let config = Config::new(
+        "http://localhost:9000/v1".to_string(),
+        "nomic-ai/nomic-embed-text-v1.5".to_string(),
+        "./documents.db".to_string(),
+        None, // API key (optional)
+    );
+
+    // Connect to the database
+    let db = DocumentDatabase::new(&config).await?;
+    let conn = db.connect().await?;
+
+    // Index a document
+    let metadata = json!({
+        "title": "My Document",
+        "author": "Author Name"
+    });
+    let doc_id = conn.insert(metadata, "Your document text here").await?;
+    println!("Indexed document: {}", doc_id);
+
+    // Search
+    let results = conn.search_topk("your query", 5).await?;
+    for (doc_id, metadata, start, end) in results {
+        println!("Found in doc {}: chars {}-{}", doc_id, start, end);
+    }
+
+    Ok(())
+}
+```
+
+## CLI Tool
+
+### Installation
+
+```bash
+git clone https://github.com/glguida/capsa
+cd capsa
+cargo build --release
+
+# Optionally install to ~/.cargo/bin
+cargo install --path .
+```
 
 ### Prerequisites
 

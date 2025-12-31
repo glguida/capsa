@@ -1,3 +1,39 @@
+//! High-level document storage and retrieval with automatic embedding generation.
+//!
+//! This module provides a convenient API for indexing and searching documents
+//! using semantic similarity. It combines the embedding functionality from
+//! [`embedder`](crate::embedder) with the vector storage from
+//! [`vectordb`](crate::vectordb).
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use capsa::{config::Config, documentdb::DocumentDatabase};
+//! use serde_json::json;
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! let config = Config::new(
+//!     "http://localhost:9000/v1".to_string(),
+//!     "nomic-ai/nomic-embed-text-v1.5".to_string(),
+//!     "./documents.db".to_string(),
+//!     None,
+//! );
+//!
+//! let db = DocumentDatabase::new(&config).await?;
+//! let conn = db.connect().await?;
+//!
+//! // Index a document
+//! let doc_id = conn.insert(
+//!     json!({"title": "Example"}),
+//!     "Document text content"
+//! ).await?;
+//!
+//! // Search for similar documents
+//! let results = conn.search_topk("query text", 5).await?;
+//! # Ok(())
+//! # }
+//! ```
+
 use crate::config::{Config, EMBEDDING_CONTEXT};
 use crate::embedder::Embedder;
 use crate::error::Result;
@@ -12,15 +48,15 @@ pub struct DocumentDatabaseConnection {
 }
 
 impl DocumentDatabaseConnection {
-    /// Inserts a document
+    /// Inserts a document into the database with automatic embedding generation.
     ///
-    /// Works identically to `insert` but invokes optional callbacks during
-    /// embedding and database insertion phases with cumulative chunk count.
+    /// The text is automatically chunked and embedded before being stored in the
+    /// vector database. Each chunk is stored with its byte offset in the original text.
     ///
     /// # Arguments
     ///
-    /// * `metadata` - Document metadata as JSON
-    /// * `text` - Document content
+    /// * `metadata` - Document metadata as JSON (title, author, etc.)
+    /// * `text` - Full document content to index
     ///
     /// # Returns
     ///
@@ -28,7 +64,22 @@ impl DocumentDatabaseConnection {
     ///
     /// # Errors
     ///
-    /// Returns an error if embedding or database insertion fails.
+    /// Returns an error if embedding generation or database insertion fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use capsa::documentdb::DocumentDatabase;
+    /// # use serde_json::json;
+    /// # async fn example(conn: &capsa::documentdb::DocumentDatabaseConnection) -> anyhow::Result<()> {
+    /// let doc_id = conn.insert(
+    ///     json!({"title": "My Document", "author": "Author"}),
+    ///     "Document content goes here"
+    /// ).await?;
+    /// println!("Inserted document with ID: {}", doc_id);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn insert(&self, metadata: serde_json::Value, text: &str) -> Result<DocumentId> {
         let vecs = self.embedder.embed_document(text).await?;
         let id = self
@@ -38,6 +89,24 @@ impl DocumentDatabaseConnection {
         Ok(id)
     }
 
+    /// Searches for the top-k most semantically similar document chunks.
+    ///
+    /// The query is automatically embedded and matched against all stored document
+    /// chunks using cosine similarity.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Natural language search query
+    /// * `limit` - Maximum number of results to return
+    ///
+    /// # Returns
+    ///
+    /// A vector of tuples containing (document_id, metadata, chunk_start, chunk_end)
+    /// ordered by similarity (most similar first).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if embedding generation or database query fails.
     pub async fn search_topk(
         &self,
         query: &str,
@@ -47,6 +116,24 @@ impl DocumentDatabaseConnection {
         self.vconn.search_topk(query_vec, limit).await
     }
 
+    /// Searches for the top-k most semantically similar document chunks with distance scores.
+    ///
+    /// Similar to [`search_topk`](Self::search_topk), but also returns cosine distance
+    /// for each result.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Natural language search query
+    /// * `limit` - Maximum number of results to return
+    ///
+    /// # Returns
+    ///
+    /// A vector of tuples containing (document_id, metadata, distance, chunk_start, chunk_end)
+    /// ordered by similarity. Lower distances indicate higher similarity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if embedding generation or database query fails.
     pub async fn search_topk_with_distance(
         &self,
         query: &str,
@@ -56,6 +143,19 @@ impl DocumentDatabaseConnection {
         self.vconn.search_topk_with_distance(query_vec, limit).await
     }
 
+    /// Retrieves the full content and metadata of a document by its ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `doc_id` - The document ID returned from [`insert`](Self::insert)
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some((content, metadata))` if the document exists, or `None` if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub async fn fetch_document(
         &self,
         doc_id: DocumentId,
@@ -122,6 +222,14 @@ impl DocumentDatabase {
         Ok(DocumentDatabase { embedder, vdb })
     }
 
+    /// Creates a new connection to the document database.
+    ///
+    /// Multiple connections can be created from the same database instance
+    /// to enable concurrent access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database connection cannot be established.
     pub async fn connect(&self) -> Result<DocumentDatabaseConnection> {
         let vconn = self.vdb.connect().await?;
         let embedder = self.embedder.clone();

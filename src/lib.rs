@@ -1,3 +1,58 @@
+//! Capsa - A compact, lightweight library for embedding-based document storage and retrieval.
+//!
+//! This library provides the core functionality for implementing RAG (Retrieval-Augmented
+//! Generation) systems. It handles document chunking, embedding generation, vector storage,
+//! and semantic search.
+//!
+//! # Quick Start
+//!
+//! ```no_run
+//! use capsa::{config::Config, documentdb::DocumentDatabase};
+//! use serde_json::json;
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     // Configure embedding service and database
+//!     let config = Config::new(
+//!         "http://localhost:9000/v1".to_string(),
+//!         "nomic-ai/nomic-embed-text-v1.5".to_string(),
+//!         "./documents.db".to_string(),
+//!         None,
+//!     );
+//!
+//!     // Connect to database
+//!     let db = DocumentDatabase::new(&config).await?;
+//!     let conn = db.connect().await?;
+//!
+//!     // Index a document
+//!     let doc_id = conn.insert(
+//!         json!({"title": "Example Document"}),
+//!         "Your document text here"
+//!     ).await?;
+//!
+//!     // Search for similar content
+//!     let results = conn.search_topk("your search query", 5).await?;
+//!     for (doc_id, metadata, start, end) in results {
+//!         println!("Found match in document {}: bytes {}-{}", doc_id, start, end);
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Architecture
+//!
+//! The library is organized into several modules:
+//!
+//! - [`config`] - Configuration types for embedding services and databases
+//! - [`documentdb`] - High-level document storage and retrieval API
+//! - [`embedder`] - Text embedding generation and chunking
+//! - [`vectordb`] - Low-level vector database operations
+//!
+//! Most applications should use [`documentdb`] which provides automatic embedding
+//! generation. Use [`vectordb`] directly only if you need fine-grained control
+//! over vector storage.
+
 pub mod config;
 pub mod documentdb;
 pub mod embedder;
