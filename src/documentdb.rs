@@ -1,3 +1,4 @@
+use crate::config::{Config, EMBEDDING_CONTEXT};
 use crate::embedder::Embedder;
 use crate::vectordb::{VectorDatabase, VectorDatabaseConnection};
 use anyhow::Result;
@@ -69,25 +70,30 @@ pub struct DocumentDatabase {
 }
 
 impl DocumentDatabase {
-    pub async fn new(
-        emb_base_url: String,
-        emb_model: String,
-        emb_api_key: Option<String>,
-        emb_ctx: usize,
-        vdb_path: String,
-    ) -> Result<Self> {
+    /// Creates a new document database using the provided configuration.
+    ///
+    /// The embedding context size is always set to the crate constant `EMBEDDING_CONTEXT`.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration containing base URL, model, API key, and database path
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the embedder cannot be created or the database cannot be initialized.
+    pub async fn new(config: &Config) -> Result<Self> {
         let embedder = Arc::new(Embedder::new(
-            emb_base_url,
-            emb_model,
-            emb_api_key,
-            emb_ctx,
+            config.base_url.clone(),
+            config.model.clone(),
+            config.api_key.clone(),
+            EMBEDDING_CONTEXT,
         )?);
 
         // Retrieve vector size by having a test query.
         let test_vec = embedder.embed_query("test").await?;
         let vec_size = test_vec.len();
 
-        let vdb = VectorDatabase::new(&vdb_path, vec_size).await?;
+        let vdb = VectorDatabase::new(&config.db_path, vec_size).await?;
 
         Ok(DocumentDatabase { embedder, vdb })
     }
