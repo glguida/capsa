@@ -1,6 +1,8 @@
 # Capsa
 
 [![CI](https://github.com/glguida/capsa/actions/workflows/ci.yml/badge.svg)](https://github.com/glguida/capsa/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/capsa.svg)](https://crates.io/crates/capsa)
+[![Documentation](https://docs.rs/capsa/badge.svg)](https://docs.rs/capsa)
 
 **A compact, lightweight library for embedding-based document storage and retrieval.**
 
