@@ -41,7 +41,7 @@ pub enum EmbeddingError {
 
     /// Error when building an embedding request
     #[error("Failed to build embedding request: {0}")]
-    RequestBuild(#[from] async_openai::error::OpenAIError),
+    RequestBuild(async_openai::error::OpenAIError),
 
     /// Error during API communication
     #[error("Embedding API error: {0}")]
