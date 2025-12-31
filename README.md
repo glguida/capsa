@@ -33,15 +33,17 @@ capsa = "0.1"
 ```rust
 use capsa::{config::Config, documentdb::DocumentDatabase};
 use serde_json::json;
+use secrecy::SecretString;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Configure the embedding service and database
+    let api_key = std::env::var("CAPSA_API_KEY").ok().map(SecretString::from);
     let config = Config::new(
         "http://localhost:9000/v1".to_string(),
         "nomic-ai/nomic-embed-text-v1.5".to_string(),
         "./documents.db".to_string(),
-        None, // API key (optional)
+        api_key,
     );
 
     // Connect to the database
@@ -257,7 +259,7 @@ Available for all commands:
 
 ### Environment Variables
 
-- `EMB_API_KEY` - API key for embedding service (optional)
+- `CAPSA_API_KEY` - API key for embedding service (optional)
 
 ## Command Reference
 

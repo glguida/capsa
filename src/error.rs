@@ -9,6 +9,7 @@ use thiserror::Error;
 ///
 /// This enum covers all possible errors that can occur when using the library,
 /// organized by their source or context.
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum CapsaError {
     /// Error occurred while generating embeddings
@@ -25,6 +26,7 @@ pub enum CapsaError {
 }
 
 /// Errors related to embedding generation
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum EmbeddingError {
     /// Error when no embedding is returned from the API
@@ -57,6 +59,7 @@ pub enum EmbeddingError {
 }
 
 /// Errors related to database operations
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum DatabaseError {
     /// Error from libsql operations
@@ -77,6 +80,7 @@ pub enum DatabaseError {
 }
 
 /// Errors related to data processing and serialization
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ProcessingError {
     /// JSON serialization/deserialization error

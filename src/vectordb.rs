@@ -12,6 +12,7 @@ use libsql::{Builder, Connection, Database};
 use serde_json::Value;
 use std::sync::Arc;
 
+#[derive(Debug)]
 struct VectorDatabaseSchema {
     create_documents_table: String,
     create_vectors_table: String,
@@ -99,6 +100,7 @@ impl VectorDatabaseSchema {
     }
 }
 
+#[derive(Debug)]
 pub struct VectorDatabaseConnection {
     conn: Connection,
     schema: Arc<VectorDatabaseSchema>,
@@ -408,6 +410,7 @@ impl VectorDatabaseConnection {
     }
 }
 
+#[derive(Debug)]
 pub struct VectorDatabase {
     db: Database,
     schema: Arc<VectorDatabaseSchema>,
