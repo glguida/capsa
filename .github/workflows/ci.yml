@@ -1,6 +1,9 @@
 # GitHub Actions workflow: CI for Rust project
 # Runs on push and pull_request: build, test (includes doctests), lint, and build docs.
 # Uploads generated HTML docs as an artifact for PR review.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 on:
   push:
   pull_request:
