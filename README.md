@@ -121,7 +121,7 @@ $
 ### Semantic Search
 
 Simple query:
-```bash
+```
 $ capsa ask -d -k 1 "What is the transformer architecture?"
 ================================================================================
 DOCUMENT RETRIEVAL SYSTEM
@@ -152,8 +152,8 @@ translation quality after being trained for as little as twelve hours on eight P
 $
 ```
 
-With similarity scores and more results:
-```bash
+Another query, on the same database:
+```
 $ capsa ask -d -k 1 "Will you disappoint me?"
 ================================================================================
 DOCUMENT RETRIEVAL SYSTEM
