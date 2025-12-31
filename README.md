@@ -4,13 +4,23 @@ Document management with embeddings.
 
 ## Commands
 
-### Add a document
+### Add a PDF document
 
 ```bash
-capsa add <path>
+capsa pdf <path>
 ```
 
 Extracts PDF metadata and text, stores in vector database.
+
+### Add a YouTube transcript
+
+```bash
+capsa yt [--lang <code>] <id_or_url>
+```
+
+Downloads YouTube transcript, stores with video metadata.
+
+- `--lang <code>` - Language code (default: en)
 
 ### Query documents
 
