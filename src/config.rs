@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_config_clone() {
-        // Test that clone works properly (since we removed derive and only kept Clone)
+        // Test that the derived Clone implementation for Config works properly
         let original = Config::new(
             "http://localhost:9000".to_string(),
             "test-model".to_string(),
