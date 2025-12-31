@@ -4,7 +4,7 @@ pub mod vectordb;
 
 #[cfg(test)]
 pub mod test_utils {
-    use crate::embedder::EmbedderClient;
+    use crate::embedder::EmbeddingInterface;
     use anyhow::Result;
     use async_trait::async_trait;
     use std::collections::hash_map::DefaultHasher;
@@ -14,18 +14,18 @@ pub mod test_utils {
     ///
     /// Generates deterministic fake embeddings based on the input text hash.
     /// This allows tests to run without requiring a real embedding server.
-    pub struct MockEmbeddingClient {
+    pub struct MockEmbedding {
         embedding_size: usize,
     }
 
-    impl MockEmbeddingClient {
+    impl MockEmbedding {
         pub fn new(embedding_size: usize) -> Self {
             Self { embedding_size }
         }
     }
 
     #[async_trait]
-    impl EmbedderClient for MockEmbeddingClient {
+    impl EmbeddingInterface for MockEmbedding {
         async fn embed_raw(&self, input: &str) -> Result<Vec<f32>> {
             if input.is_empty() {
                 return Err(anyhow::anyhow!("Empty input not allowed"));

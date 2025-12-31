@@ -16,7 +16,7 @@ use async_trait::async_trait;
 /// This trait allows for different implementations of embedding clients,
 /// including real API clients and mock clients for testing.
 #[async_trait]
-pub trait EmbedderClient: Send + Sync {
+pub trait EmbeddingInterface: Send + Sync {
     /// Generates an embedding vector for the given text input.
     ///
     /// # Arguments
@@ -53,12 +53,12 @@ pub trait EmbedderClient: Send + Sync {
 ///
 /// This client handles authentication and communication with embedding services
 /// that implement the OpenAI embeddings API format.
-pub struct EmbeddingClient {
+pub struct OAIEmbedding {
     client: Client<OpenAIConfig>,
     model: String,
 }
 
-impl EmbeddingClient {
+impl OAIEmbedding {
     /// Creates a new embedding client.
     ///
     /// # Arguments
@@ -78,7 +78,7 @@ impl EmbeddingClient {
 }
 
 #[async_trait]
-impl EmbedderClient for EmbeddingClient {
+impl EmbeddingInterface for OAIEmbedding {
     /// Generates an embedding vector for the given text input.
     ///
     /// # Arguments
@@ -140,12 +140,12 @@ impl EmbedderClient for EmbeddingClient {
 #[cfg(test)]
 mod client_tests {
     use super::*;
-    use crate::test_utils::MockEmbeddingClient;
+    use crate::test_utils::MockEmbedding;
     use tokio;
 
     #[tokio::test]
     async fn test_mock_client() -> Result<()> {
-        let client = MockEmbeddingClient::new(384);
+        let client = MockEmbedding::new(384);
         let emb1 = client.embed_raw("test").await?;
         let emb2 = client.embed_raw("test").await?;
         let emb3 = client.embed_raw("different").await?;
@@ -160,7 +160,7 @@ mod client_tests {
     async fn test_embed_client_openai() -> Result<()> {
         let key = std::env::var("OPENAI_API_KEY").ok();
         if let Some(k) = key {
-            let client = EmbeddingClient::new(
+            let client = OAIEmbedding::new(
                 "https://api.openai.com/v1".to_string(),
                 Some(k),
                 "text-embedding-3-small".to_string(),
@@ -173,7 +173,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_empty_input() -> Result<()> {
-        let client = MockEmbeddingClient::new(384);
+        let client = MockEmbedding::new(384);
         let res = client.embed_raw("").await;
         assert!(res.is_err());
         Ok(())
@@ -181,7 +181,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_mock_client_batch() -> Result<()> {
-        let client = MockEmbeddingClient::new(384);
+        let client = MockEmbedding::new(384);
         let inputs = vec![
             "first test".to_string(),
             "second test".to_string(),
@@ -212,7 +212,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_embed_batch_empty() -> Result<()> {
-        let client = EmbeddingClient::new(
+        let client = OAIEmbedding::new(
             "http://localhost:9000/v1".to_string(),
             None,
             "model".to_string(),
@@ -226,7 +226,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_embed_batch_single() -> Result<()> {
-        let client = EmbeddingClient::new(
+        let client = OAIEmbedding::new(
             "http://localhost:9000/v1".to_string(),
             None,
             "model".to_string(),
@@ -242,7 +242,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_embed_batch_multiple() -> Result<()> {
-        let client = EmbeddingClient::new(
+        let client = OAIEmbedding::new(
             "http://localhost:9000/v1".to_string(),
             None,
             "model".to_string(),
@@ -266,7 +266,7 @@ mod client_tests {
     async fn test_embed_batch_openai() -> Result<()> {
         let key = std::env::var("OPENAI_API_KEY").ok();
         if let Some(k) = key {
-            let client = EmbeddingClient::new(
+            let client = OAIEmbedding::new(
                 "https://api.openai.com/v1".to_string(),
                 Some(k),
                 "text-embedding-3-small".to_string(),
@@ -287,7 +287,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_embed_batch_large() -> Result<()> {
-        let client = EmbeddingClient::new(
+        let client = OAIEmbedding::new(
             "http://localhost:9000/v1".to_string(),
             None,
             "model".to_string(),
@@ -304,7 +304,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_embed_batch_consistency() -> Result<()> {
-        let client = EmbeddingClient::new(
+        let client = OAIEmbedding::new(
             "http://localhost:9000/v1".to_string(),
             None,
             "model".to_string(),
@@ -635,7 +635,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 /// Combines an embedding client with text splitting to handle documents
 /// of any size, automatically chunking and processing them in parallel.
 pub struct Embedder {
-    client: Box<dyn EmbedderClient>,
+    client: Box<dyn EmbeddingInterface>,
     splitter: EmbeddingSplitter,
 }
 
@@ -659,7 +659,7 @@ impl Embedder {
         n_ctx: usize,
     ) -> Result<Self> {
         let splitter = EmbeddingSplitter::new(&model, n_ctx)?;
-        let client = EmbeddingClient::new(base_url, api_key, model);
+        let client = OAIEmbedding::new(base_url, api_key, model);
         Ok(Embedder {
             client: Box::new(client),
             splitter,
@@ -673,7 +673,7 @@ impl Embedder {
     ///
     /// # Arguments
     ///
-    /// * `client` - An implementation of the EmbedderClient trait
+    /// * `client` - An implementation of the EmbeddingInterface trait
     /// * `model` - Name of the tokenizer model to use for text splitting
     /// * `n_ctx` - Maximum context size in tokens
     ///
@@ -681,7 +681,7 @@ impl Embedder {
     ///
     /// Returns an error if the tokenizer for the model cannot be loaded.
     pub fn with_client(
-        client: Box<dyn EmbedderClient>,
+        client: Box<dyn EmbeddingInterface>,
         model: String,
         n_ctx: usize,
     ) -> Result<Self> {
@@ -761,14 +761,14 @@ impl Embedder {
 #[cfg(test)]
 mod embedder_tests {
     use super::*;
-    use crate::test_utils::MockEmbeddingClient;
+    use crate::test_utils::MockEmbedding;
 
     /// Helper to create a mock embedder for testing without network dependencies.
     ///
     /// Uses a simple tokenizer model that doesn't require downloading from HuggingFace.
     /// Note: This still requires the tokenizer to be available locally or cached.
     fn create_mock_embedder() -> Result<Embedder> {
-        let client = Box::new(MockEmbeddingClient::new(384));
+        let client = Box::new(MockEmbedding::new(384));
         // Use bert-base-uncased as it's commonly cached
         Embedder::with_client(client, "bert-base-uncased".to_string(), 512)
     }
