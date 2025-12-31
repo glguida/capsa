@@ -1,16 +1,41 @@
 use anyhow::{Context, Result};
+use capsa::config::Config;
 use capsa::documentdb::DocumentDatabase;
 use clap::{Parser, Subcommand};
 use lru::LruCache;
 use serde_json::json;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use yt_transcript_rs::YouTubeTranscriptApi;
+
+static CONFIG: OnceLock<Config> = OnceLock::new();
 
 #[derive(Parser)]
 #[command(name = "capsa")]
 #[command(about = "Document management with embeddings", long_about = None)]
 struct Cli {
+    #[arg(
+        long,
+        default_value = "http://localhost:9000/v1",
+        help = "Base URL for the embedding API"
+    )]
+    base_url: String,
+
+    #[arg(
+        long,
+        default_value = "nomic-ai/nomic-embed-text-v1.5",
+        help = "Embedding model to use"
+    )]
+    model: String,
+
+    #[arg(
+        long,
+        default_value = "./documents.db",
+        help = "Path to the vector database"
+    )]
+    db_path: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -219,34 +244,16 @@ async fn add_yt_document(id_or_url: String, lang: String) -> Result<()> {
         "language": transcript.language,
     });
 
-    let emb_base_url =
-        std::env::var("EMB_BASE_URL").unwrap_or_else(|_| "http://localhost:9000/v1".to_string());
-    let emb_model =
-        std::env::var("EMB_MODEL").unwrap_or_else(|_| "nomic-ai/nomic-embed-text-v1.5".to_string());
-    let emb_api_key = std::env::var("EMB_API_KEY").ok();
-    let emb_ctx = std::env::var("EMB_CTX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(128);
-    let vdb_path = std::env::var("VDB_PATH").unwrap_or_else(|_| "./documents.db".to_string());
-
     print!("INITIALIZING DATABASE CONNECTION...");
-    let db = DocumentDatabase::new(emb_base_url, emb_model, emb_api_key, emb_ctx, vdb_path).await?;
+    let db = DocumentDatabase::new(CONFIG.get().expect("Config not initialized")).await?;
 
     let conn = db.connect().await?;
     println!(" DONE");
     println!();
 
-    println!("PROCESSING:");
-    use std::cell::Cell;
-
-    let total_chunks = Cell::new(0);
+    print!("PROCESSING...");
     let doc_id = conn.insert(metadata, &text).await?;
-
-    println!(
-        "\r  DATABASE: {} CHUNKS - COMPLETE        ",
-        total_chunks.get()
-    );
+    println!(" COMPLETE");
 
     println!();
     println!("================================================================================");
@@ -284,34 +291,16 @@ async fn add_pdf_document(path: PathBuf) -> Result<()> {
     );
     println!();
 
-    let emb_base_url =
-        std::env::var("EMB_BASE_URL").unwrap_or_else(|_| "http://localhost:9000/v1".to_string());
-    let emb_model =
-        std::env::var("EMB_MODEL").unwrap_or_else(|_| "nomic-ai/nomic-embed-text-v1.5".to_string());
-    let emb_api_key = std::env::var("EMB_API_KEY").ok();
-    let emb_ctx = std::env::var("EMB_CTX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(128);
-    let vdb_path = std::env::var("VDB_PATH").unwrap_or_else(|_| "./documents.db".to_string());
-
     print!("INITIALIZING DATABASE CONNECTION...");
-    let db = DocumentDatabase::new(emb_base_url, emb_model, emb_api_key, emb_ctx, vdb_path).await?;
+    let db = DocumentDatabase::new(CONFIG.get().expect("Config not initialized")).await?;
 
     let conn = db.connect().await?;
     println!(" DONE");
     println!();
 
-    println!("PROCESSING:");
-    use std::cell::Cell;
-
-    let total_chunks = Cell::new(0);
+    print!("PROCESSING...");
     let doc_id = conn.insert(metadata, &text).await?;
-
-    println!(
-        "\r  DATABASE: {} CHUNKS - COMPLETE        ",
-        total_chunks.get()
-    );
+    println!(" COMPLETE");
 
     println!();
     println!("================================================================================");
@@ -322,17 +311,6 @@ async fn add_pdf_document(path: PathBuf) -> Result<()> {
 }
 
 async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<()> {
-    let emb_base_url =
-        std::env::var("EMB_BASE_URL").unwrap_or_else(|_| "http://localhost:9000/v1".to_string());
-    let emb_model =
-        std::env::var("EMB_MODEL").unwrap_or_else(|_| "nomic-ai/nomic-embed-text-v1.5".to_string());
-    let emb_api_key = std::env::var("EMB_API_KEY").ok();
-    let emb_ctx = std::env::var("EMB_CTX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(128);
-    let vdb_path = std::env::var("VDB_PATH").unwrap_or_else(|_| "./documents.db".to_string());
-
     println!("================================================================================");
     println!("DOCUMENT RETRIEVAL SYSTEM");
     println!("================================================================================");
@@ -344,7 +322,7 @@ async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<(
     use std::io::Write;
     std::io::stdout().flush()?;
 
-    let db = DocumentDatabase::new(emb_base_url, emb_model, emb_api_key, emb_ctx, vdb_path).await?;
+    let db = DocumentDatabase::new(CONFIG.get().expect("Config not initialized")).await?;
 
     let conn = db.connect().await?;
     println!(" DONE");
@@ -507,6 +485,10 @@ async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Initialize global configuration
+    let api_key = std::env::var("EMB_API_KEY").ok();
+    CONFIG.get_or_init(|| Config::new(cli.base_url, cli.model, cli.db_path, api_key));
 
     match cli.command {
         Commands::Pdf { path } => {
