@@ -7,7 +7,7 @@
 pub const EMBEDDING_CONTEXT: usize = 128;
 
 /// Runtime configuration for the embedding system.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Base URL for the embedding API endpoint
     pub base_url: String,
@@ -35,5 +35,87 @@ impl Config {
             db_path,
             api_key,
         }
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("db_path", &self.db_path)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_debug_redacts_api_key() {
+        // Test with API key present
+        let config_with_key = Config::new(
+            "http://localhost:9000".to_string(),
+            "test-model".to_string(),
+            "./test.db".to_string(),
+            Some("super-secret-api-key-12345".to_string()),
+        );
+
+        let debug_output = format!("{:?}", config_with_key);
+
+        // Should contain redacted marker
+        assert!(debug_output.contains("[REDACTED]"));
+
+        // Should NOT contain the actual API key
+        assert!(!debug_output.contains("super-secret-api-key-12345"));
+
+        // Should still contain other fields
+        assert!(debug_output.contains("http://localhost:9000"));
+        assert!(debug_output.contains("test-model"));
+        assert!(debug_output.contains("./test.db"));
+    }
+
+    #[test]
+    fn test_config_debug_without_api_key() {
+        // Test without API key
+        let config_without_key = Config::new(
+            "http://localhost:9000".to_string(),
+            "test-model".to_string(),
+            "./test.db".to_string(),
+            None,
+        );
+
+        let debug_output = format!("{:?}", config_without_key);
+
+        // Should not contain redacted marker when no key present
+        assert!(!debug_output.contains("[REDACTED]"));
+
+        // Should contain None
+        assert!(debug_output.contains("None"));
+
+        // Should still contain other fields
+        assert!(debug_output.contains("http://localhost:9000"));
+        assert!(debug_output.contains("test-model"));
+        assert!(debug_output.contains("./test.db"));
+    }
+
+    #[test]
+    fn test_config_clone() {
+        // Test that clone works properly (since we removed derive and only kept Clone)
+        let original = Config::new(
+            "http://localhost:9000".to_string(),
+            "test-model".to_string(),
+            "./test.db".to_string(),
+            Some("api-key".to_string()),
+        );
+
+        let cloned = original.clone();
+
+        assert_eq!(original.base_url, cloned.base_url);
+        assert_eq!(original.model, cloned.model);
+        assert_eq!(original.db_path, cloned.db_path);
+        assert_eq!(original.api_key, cloned.api_key);
     }
 }
