@@ -114,6 +114,8 @@ impl VectorDatabaseConnection {
     async fn new(conn: Connection, schema: Arc<VectorDatabaseSchema>) -> Result<Self> {
         // Enable foreign keys for the ON DELETE CASCADE behavior
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
+        // Enable WAL mode for better concurrency and performance
+        conn.query("PRAGMA journal_mode = WAL", ()).await?;
 
         let db = Self { conn, schema };
         db.setup_schema().await?;
