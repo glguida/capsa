@@ -394,6 +394,7 @@ dependencies = [
  "serde_json",
  "stream",
  "text-splitter",
+ "thiserror 2.0.17",
  "tokenizers",
  "tokio",
  "yt-transcript-rs",
