@@ -5,6 +5,7 @@ use lru::LruCache;
 use serde_json::json;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use yt_transcript_rs::YouTubeTranscriptApi;
 
 #[derive(Parser)]
 #[command(name = "capsa")]
@@ -16,9 +17,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Add {
+    Pdf {
         #[arg(help = "Path to the PDF file")]
         path: PathBuf,
+    },
+    Yt {
+        #[arg(help = "YouTube video ID or URL")]
+        id_or_url: String,
+
+        #[arg(long = "lang", default_value = "en", help = "Transcript language code")]
+        lang: String,
     },
     Ask {
         #[arg(help = "Query string")]
@@ -125,9 +133,132 @@ async fn extract_pdf_metadata_and_text(path: &PathBuf) -> Result<(serde_json::Va
     Ok((metadata, text))
 }
 
-async fn add_document(path: PathBuf) -> Result<()> {
+fn extract_video_id(id_or_url: &str) -> Result<String> {
+    if id_or_url.len() == 11 && !id_or_url.contains('/') && !id_or_url.contains('&') {
+        return Ok(id_or_url.to_string());
+    }
+
+    if let Some(v_pos) = id_or_url.find("v=") {
+        let start = v_pos + 2;
+        let end = id_or_url[start..]
+            .find('&')
+            .map(|pos| start + pos)
+            .unwrap_or(id_or_url.len());
+        return Ok(id_or_url[start..end].to_string());
+    }
+
+    if id_or_url.contains("youtu.be/")
+        && let Some(slash_pos) = id_or_url.rfind('/')
+    {
+        let start = slash_pos + 1;
+        let end = id_or_url[start..]
+            .find('?')
+            .map(|pos| start + pos)
+            .unwrap_or(id_or_url.len());
+        return Ok(id_or_url[start..end].to_string());
+    }
+
+    anyhow::bail!("Could not extract video ID from: {}", id_or_url);
+}
+
+async fn add_yt_document(id_or_url: String, lang: String) -> Result<()> {
     println!("================================================================================");
-    println!("DOCUMENT INGESTION SYSTEM");
+    println!("YOUTUBE TRANSCRIPT INGESTION SYSTEM");
+    println!("================================================================================");
+    println!("INPUT.....: {}", id_or_url);
+    println!("LANGUAGE..: {}", lang);
+    println!();
+
+    println!("EXTRACTING VIDEO ID...");
+    let video_id = extract_video_id(&id_or_url)?;
+    println!("VIDEO ID..: {}", video_id);
+    println!();
+
+    println!("FETCHING VIDEO DETAILS...");
+    let api = YouTubeTranscriptApi::new(None, None, None)?;
+
+    let details = api
+        .fetch_video_details(&video_id)
+        .await
+        .with_context(|| format!("Failed to fetch video details for: {}", video_id))?;
+
+    let title = details.title;
+    let author = details.author;
+    let video_url = format!("https://www.youtube.com/watch?v={}", video_id);
+
+    println!("TITLE.....: {}", title);
+    println!("AUTHOR....: {}", author);
+    println!();
+
+    println!("FETCHING TRANSCRIPT...");
+    let languages = &[lang.as_str()];
+    let preserve_formatting = false;
+
+    let transcript = api
+        .fetch_transcript(&video_id, languages, preserve_formatting)
+        .await
+        .with_context(|| format!("Failed to fetch transcript for: {}", video_id))?;
+
+    let text: String = transcript
+        .snippets
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    println!("TRANSCRIPT FETCHED");
+    println!("TEXT SIZE.: {} CHARACTERS", text.len());
+    println!("LANGUAGE..: {}", transcript.language);
+    println!();
+
+    let metadata = json!({
+        "title": title,
+        "author": author,
+        "video_url": video_url,
+        "video_id": video_id,
+        "language": transcript.language,
+    });
+
+    let emb_base_url =
+        std::env::var("EMB_BASE_URL").unwrap_or_else(|_| "http://localhost:9000/v1".to_string());
+    let emb_model =
+        std::env::var("EMB_MODEL").unwrap_or_else(|_| "nomic-ai/nomic-embed-text-v1.5".to_string());
+    let emb_api_key = std::env::var("EMB_API_KEY").ok();
+    let emb_ctx = std::env::var("EMB_CTX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
+    let vdb_path = std::env::var("VDB_PATH").unwrap_or_else(|_| "./documents.db".to_string());
+
+    print!("INITIALIZING DATABASE CONNECTION...");
+    let db = DocumentDatabase::new(emb_base_url, emb_model, emb_api_key, emb_ctx, vdb_path).await?;
+
+    let conn = db.connect().await?;
+    println!(" DONE");
+    println!();
+
+    println!("PROCESSING:");
+    use std::cell::Cell;
+
+    let total_chunks = Cell::new(0);
+    let doc_id = conn.insert(metadata, &text).await?;
+
+    println!(
+        "\r  DATABASE: {} CHUNKS - COMPLETE        ",
+        total_chunks.get()
+    );
+
+    println!();
+    println!("================================================================================");
+    println!("INGESTION COMPLETE - DOCID={:06}", doc_id);
+    println!("================================================================================");
+
+    Ok(())
+}
+
+async fn add_pdf_document(path: PathBuf) -> Result<()> {
+    println!("================================================================================");
+    println!("PDF DOCUMENT INGESTION SYSTEM");
     println!("================================================================================");
     println!("FILE......: {}", path.display());
     println!();
@@ -378,8 +509,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Add { path } => {
-            add_document(path).await?;
+        Commands::Pdf { path } => {
+            add_pdf_document(path).await?;
+        }
+        Commands::Yt { id_or_url, lang } => {
+            add_yt_document(id_or_url, lang).await?;
         }
         Commands::Ask {
             query,
