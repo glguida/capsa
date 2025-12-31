@@ -39,6 +39,12 @@ jobs:
       - name: Run tests (includes doctests)
         run: cargo test --workspace --verbose
 
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --locked
+
+      - name: Check semver compatibility
+        run: cargo semver-checks check-release --baseline-rev v0.1.0
+
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
