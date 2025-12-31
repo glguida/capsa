@@ -38,8 +38,8 @@ docker run -p 9000:80 ghcr.io/huggingface/text-embeddings-inference:latest \
 
 For CPU only support:
 ```bash
- docker run -p 9000:80 ghcr.io/huggingface/text-embeddings-inference:cpu-latest \
-   --model-id nomic-ai/nomic-embed-text-v1.5
+docker run -p 9000:80 ghcr.io/huggingface/text-embeddings-inference:cpu-latest \
+  --model-id nomic-ai/nomic-embed-text-v1.5
 ```
 
 **Option 3: Any OpenAI-compatible API** (remote or local)
