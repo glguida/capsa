@@ -11,10 +11,10 @@ use async_openai::{
 };
 use async_trait::async_trait;
 
-/// Trait for embedding clients that can generate vector embeddings from text.
+/// Trait defining the interface for embedding implementations.
 ///
-/// This trait allows for different implementations of embedding clients,
-/// including real API clients and mock clients for testing.
+/// This trait allows for different implementations of embedding services,
+/// including real API clients and mock implementations for testing.
 #[async_trait]
 pub trait EmbeddingInterface: Send + Sync {
     /// Generates an embedding vector for the given text input.
@@ -59,7 +59,7 @@ pub struct OAIEmbedding {
 }
 
 impl OAIEmbedding {
-    /// Creates a new embedding client.
+    /// Creates a new OpenAI-compatible embedding implementation.
     ///
     /// # Arguments
     ///
@@ -632,7 +632,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 
 /// High-level API for generating embeddings from various text sources.
 ///
-/// Combines an embedding client with text splitting to handle documents
+/// Combines an embedding implementation with text splitting to handle documents
 /// of any size, automatically chunking and processing them in parallel.
 pub struct Embedder {
     client: Box<dyn EmbeddingInterface>,
@@ -666,10 +666,10 @@ impl Embedder {
         })
     }
 
-    /// Creates a new embedder with a custom client implementation.
+    /// Creates a new embedder with a custom embedding implementation.
     ///
-    /// This constructor allows injecting a custom embedding client,
-    /// which is useful for testing with mock clients.
+    /// This constructor allows injecting a custom embedding implementation,
+    /// which is useful for testing with mock implementations.
     ///
     /// # Arguments
     ///

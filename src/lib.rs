@@ -10,7 +10,7 @@ pub mod test_utils {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    /// Mock embedding client for testing.
+    /// Mock embedding implementation for testing.
     ///
     /// Generates deterministic fake embeddings based on the input text hash.
     /// This allows tests to run without requiring a real embedding server.
