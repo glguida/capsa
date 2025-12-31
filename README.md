@@ -65,24 +65,122 @@ capsa ask -d -k 20 "detailed query"
 
 Add a PDF document:
 ```bash
-capsa pdf attention-is-all-you-need.pdf
+$ capsa pdf attention-is-all-you-need.pdf
+================================================================================
+PDF DOCUMENT INGESTION SYSTEM
+================================================================================
+FILE......: attention-is-all-you-need.pdf
+
+EXTRACTING TEXT...
+EXTRACTION COMPLETE
+TEXT SIZE.: 33110 CHARACTERS
+TITLE.....: Attention is All you Need
+AUTHOR....: Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, �ukasz Kaiser, Illia Polosukhin
+
+INITIALIZING DATABASE CONNECTION... DONE
+
+PROCESSING... COMPLETE
+
+================================================================================
+INGESTION COMPLETE - DOCID=000001
+================================================================================
+$
 ```
 
 Add a YouTube video transcript:
 ```bash
-capsa yt dQw4w9WgXcQ
+$ capsa yt dQw4w9WgXcQ
+================================================================================
+YOUTUBE TRANSCRIPT INGESTION SYSTEM
+================================================================================
+INPUT.....: dQw4w9WgXcQ
+LANGUAGE..: en
+
+EXTRACTING VIDEO ID...
+VIDEO ID..: dQw4w9WgXcQ
+
+FETCHING VIDEO DETAILS...
+TITLE.....: Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)
+AUTHOR....: Rick Astley
+
+FETCHING TRANSCRIPT...
+TRANSCRIPT FETCHED
+TEXT SIZE.: 2335 CHARACTERS
+LANGUAGE..: English
+
+INITIALIZING DATABASE CONNECTION... DONE
+
+PROCESSING... COMPLETE
+
+================================================================================
+INGESTION COMPLETE - DOCID=000002
+================================================================================
+$
 ```
 
 ### Semantic Search
 
 Simple query:
 ```bash
-capsa ask "What is the transformer architecture?"
+$ capsa ask -d -k 1 "What is the transformer architecture?"
+================================================================================
+DOCUMENT RETRIEVAL SYSTEM
+================================================================================
+QUERY.....: What is the transformer architecture?
+TOP-K.....: 1
+
+INITIALIZING DATABASE CONNECTION... DONE
+
+================================================================================
+RECORD 001  DOCID=000001  SIMILARITY= 76.70%
+================================================================================
+TITLE..: Attention is All you Need
+AUTHOR.: Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, �ukasz Kaiser, Illia Polosukhin
+SUBJECT: Neural Information Processing Systems http://nips.cc/
+FILE...: attention-is-all-you-need.pdf
+OFFSET.: 4080-4478 (398 BYTES)
+--------------------------------------------------------------------------------
+CONTENT:
+--------------------------------------------------------------------------------
+In this work we propose the Transformer, a model architecture eschewing recurrence and instead
+relying entirely on an attention mechanism to draw global dependencies between input and output.
+The Transformer allows for signiﬁcantly more parallelization and can reach a new state of the art in
+translation quality after being trained for as little as twelve hours on eight P100 GPUs.
+
+2 Background
+--------------------------------------------------------------------------------
+$
 ```
 
 With similarity scores and more results:
 ```bash
-capsa ask -d -k 10 "self-attention mechanism"
+$ capsa ask -d -k 1 "Will you disappoint me?"
+================================================================================
+DOCUMENT RETRIEVAL SYSTEM
+================================================================================
+QUERY.....: Will you disappoint me?
+TOP-K.....: 1
+
+INITIALIZING DATABASE CONNECTION... DONE
+
+================================================================================
+RECORD 001  DOCID=000002  SIMILARITY= 54.33%
+================================================================================
+TITLE..: Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)
+AUTHOR.: Rick Astley
+OFFSET.: 511-974 (463 BYTES)
+--------------------------------------------------------------------------------
+CONTENT:
+--------------------------------------------------------------------------------
+for so long ♪ ♪ Your heart's been aching
+but you're too shy to say it ♪ ♪ Inside we both know
+what's been going ♪ ♪ We know the game
+and we're gonna play it ♪ ♪ And if you ask me
+how I'm feeling ♪ ♪ Don't tell me
+you're too blind to see ♪ ♪ Never gonna give you up ♪ ♪ Never gonna let you down ♪ ♪ Never gonna run around
+and desert you ♪ ♪ Never gonna make you cry ♪ ♪ Never gonna say goodbye ♪ ♪ Never gonna tell a lie
+--------------------------------------------------------------------------------
+$
 ```
 
 Output with `-d` shows cosine similarity percentages, helping you gauge result relevance.
