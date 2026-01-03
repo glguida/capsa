@@ -113,7 +113,9 @@ impl VectorDatabaseConnection {
     /// do not already exist.
     async fn new(conn: Connection, schema: Arc<VectorDatabaseSchema>) -> Result<Self> {
         // Enable WAL mode for better performance and concurrency
-        // Note: PRAGMA journal_mode returns a result, so we need to use query()
+        // Note: WAL mode is not available for in-memory databases, which will
+        // continue using the default journal mode. This is expected and acceptable.
+        // PRAGMA journal_mode returns a result, so we need to use query()
         let _ = conn.query("PRAGMA journal_mode = WAL", ()).await?;
 
         // Enable foreign keys for the ON DELETE CASCADE behavior
@@ -410,6 +412,19 @@ impl VectorDatabaseConnection {
             Ok(Some((content, metadata)))
         } else {
             Ok(None)
+        }
+    }
+
+    #[cfg(test)]
+    async fn get_journal_mode(&self) -> Result<String> {
+        let mut rows = self.conn.query("PRAGMA journal_mode", ()).await?;
+        if let Some(row) = rows.next().await? {
+            Ok(row.get(0)?)
+        } else {
+            Err(crate::error::DatabaseError::QueryFailed(
+                "PRAGMA journal_mode returned no results".to_string(),
+            )
+            .into())
         }
     }
 }
@@ -1035,20 +1050,14 @@ mod db_tests {
         let db = VectorDatabase::new(db_path.to_str().unwrap(), 3).await?;
         let conn = db.connect().await?;
 
-        // Query the journal_mode pragma to verify WAL is enabled
-        let mut rows = conn.conn.query("PRAGMA journal_mode", ()).await?;
-
-        if let Some(row) = rows.next().await? {
-            let mode: String = row.get(0)?;
-            assert_eq!(
-                mode.to_lowercase(),
-                "wal",
-                "Expected journal_mode to be 'wal' but got '{}'",
-                mode
-            );
-        } else {
-            panic!("PRAGMA journal_mode returned no results");
-        }
+        // Query the journal_mode to verify WAL is enabled
+        let mode = conn.get_journal_mode().await?;
+        assert_eq!(
+            mode.to_lowercase(),
+            "wal",
+            "Expected journal_mode to be 'wal' but got '{}'",
+            mode
+        );
 
         Ok(())
     }
