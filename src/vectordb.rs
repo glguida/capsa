@@ -112,6 +112,19 @@ impl VectorDatabaseConnection {
     /// This sets up the necessary tables and indices for vector storage if they
     /// do not already exist.
     async fn new(conn: Connection, schema: Arc<VectorDatabaseSchema>) -> Result<Self> {
+        // Enable WAL mode for better performance and concurrency
+        // See: https://www.sqlite.org/wal.html
+        // Note: WAL mode is not available for in-memory databases, which will
+        // continue using the default journal mode. This is expected and acceptable.
+        // See: https://www.sqlite.org/pragma.html#pragma_journal_mode
+        // PRAGMA journal_mode returns a row with the mode that was actually set,
+        // so we must use query() instead of execute() (which expects no result rows).
+        // We consume the result to ensure the command succeeded.
+        conn.query("PRAGMA journal_mode = WAL", ())
+            .await?
+            .next()
+            .await?;
+
         // Enable foreign keys for the ON DELETE CASCADE behavior
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
 
@@ -406,6 +419,19 @@ impl VectorDatabaseConnection {
             Ok(Some((content, metadata)))
         } else {
             Ok(None)
+        }
+    }
+
+    #[cfg(test)]
+    async fn get_journal_mode(&self) -> Result<String> {
+        let mut rows = self.conn.query("PRAGMA journal_mode", ()).await?;
+        if let Some(row) = rows.next().await? {
+            Ok(row.get(0)?)
+        } else {
+            Err(crate::error::DatabaseError::QueryFailed(
+                "PRAGMA journal_mode returned no results".to_string(),
+            )
+            .into())
         }
     }
 }
@@ -1019,6 +1045,26 @@ mod db_tests {
             .search_topk_with_distance(vec![0.5, 0.0, 0.0], 10)
             .await?;
         assert_eq!(results.len(), 5);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_mode_enabled() -> Result<()> {
+        // Test that WAL mode is enabled on file-based databases
+        let temp_dir = tempfile::tempdir()?;
+        let db_path = temp_dir.path().join("test_wal.db");
+        let db = VectorDatabase::new(db_path.to_str().unwrap(), 3).await?;
+        let conn = db.connect().await?;
+
+        // Query the journal_mode to verify WAL is enabled
+        let mode = conn.get_journal_mode().await?;
+        assert_eq!(
+            mode.to_lowercase(),
+            "wal",
+            "Expected journal_mode to be 'wal' but got '{}'",
+            mode
+        );
 
         Ok(())
     }
