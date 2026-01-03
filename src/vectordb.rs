@@ -115,8 +115,12 @@ impl VectorDatabaseConnection {
         // Enable WAL mode for better performance and concurrency
         // Note: WAL mode is not available for in-memory databases, which will
         // continue using the default journal mode. This is expected and acceptable.
-        // PRAGMA journal_mode returns a result, so we need to use query()
-        let _ = conn.query("PRAGMA journal_mode = WAL", ()).await?;
+        // PRAGMA journal_mode returns the mode that was actually set, so we consume
+        // the result to ensure the command succeeded.
+        conn.query("PRAGMA journal_mode = WAL", ())
+            .await?
+            .next()
+            .await?;
 
         // Enable foreign keys for the ON DELETE CASCADE behavior
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
