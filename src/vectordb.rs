@@ -113,10 +113,13 @@ impl VectorDatabaseConnection {
     /// do not already exist.
     async fn new(conn: Connection, schema: Arc<VectorDatabaseSchema>) -> Result<Self> {
         // Enable WAL mode for better performance and concurrency
+        // See: https://www.sqlite.org/wal.html
         // Note: WAL mode is not available for in-memory databases, which will
         // continue using the default journal mode. This is expected and acceptable.
-        // PRAGMA journal_mode returns the mode that was actually set, so we consume
-        // the result to ensure the command succeeded.
+        // See: https://www.sqlite.org/pragma.html#pragma_journal_mode
+        // PRAGMA journal_mode returns a row with the mode that was actually set,
+        // so we must use query() instead of execute() (which expects no result rows).
+        // We consume the result to ensure the command succeeded.
         conn.query("PRAGMA journal_mode = WAL", ())
             .await?
             .next()
