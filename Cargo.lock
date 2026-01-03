@@ -394,6 +394,7 @@ dependencies = [
  "secrecy",
  "serde_json",
  "stream",
+ "tempfile",
  "text-splitter",
  "thiserror 2.0.17",
  "tokenizers",
