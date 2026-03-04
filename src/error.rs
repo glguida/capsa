@@ -94,6 +94,10 @@ pub enum ProcessingError {
     /// Generic I/O error
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// UTF-8 decoding error
+    #[error("UTF-8 decoding error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
 }
 
 /// Result type alias for Capsa operations
@@ -127,5 +131,11 @@ impl From<async_openai::error::OpenAIError> for CapsaError {
 impl From<std::io::Error> for CapsaError {
     fn from(err: std::io::Error) -> Self {
         CapsaError::Processing(ProcessingError::Io(err))
+    }
+}
+
+impl From<std::string::FromUtf8Error> for CapsaError {
+    fn from(err: std::string::FromUtf8Error) -> Self {
+        CapsaError::Processing(ProcessingError::Utf8(err))
     }
 }

@@ -8,12 +8,15 @@
 //! module which handles embedding generation automatically.
 
 use crate::error::{DatabaseError, Result};
-use libsql::{Builder, Connection, Database};
+use async_compression::futures::bufread::{Lz4Decoder, Lz4Encoder};
+use futures::io::{AsyncReadExt, Cursor};
+use libsql::{Builder, Connection, Database, Transaction, TransactionBehavior};
 use serde_json::Value;
 use std::sync::Arc;
 
 #[derive(Debug)]
 struct VectorDatabaseSchema {
+    vec_size: usize,
     create_documents_table: String,
     create_vectors_table: String,
     create_index_table: String,
@@ -30,7 +33,7 @@ impl VectorDatabaseSchema {
         let create_documents_table = format!(
             "CREATE TABLE IF NOT EXISTS documents_{} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT,
+                content BLOB,
                 metadata JSON
             )",
             vec_size
@@ -87,6 +90,7 @@ impl VectorDatabaseSchema {
             vec_size
         );
         VectorDatabaseSchema {
+            vec_size,
             create_documents_table,
             create_vectors_table,
             create_index_table,
@@ -111,7 +115,11 @@ impl VectorDatabaseConnection {
     ///
     /// This sets up the necessary tables and indices for vector storage if they
     /// do not already exist.
-    async fn new(conn: Connection, schema: Arc<VectorDatabaseSchema>) -> Result<Self> {
+    async fn new(
+        conn: Connection,
+        schema: Arc<VectorDatabaseSchema>,
+        expected_model: Option<&str>,
+    ) -> Result<Self> {
         // Enable WAL mode for better performance and concurrency
         // See: https://www.sqlite.org/wal.html
         // Note: WAL mode is not available for in-memory databases, which will
@@ -127,11 +135,166 @@ impl VectorDatabaseConnection {
 
         // Enable foreign keys for the ON DELETE CASCADE behavior
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
+        // Enable WAL. 'query' because there's a "Execute returned rows" error. To investigate.
+        conn.query("PRAGMA journal_mode = WAL", ()).await?;
+
+        Self::validate_metadata(&conn, schema.vec_size, expected_model).await?;
 
         let db = Self { conn, schema };
         db.setup_schema().await?;
 
         Ok(db)
+    }
+
+    async fn setup_metadata_table(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS capsa_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+            (),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn get_metadata(conn: &Connection, key: &str) -> Result<Option<String>> {
+        let mut rows = conn
+            .query("SELECT value FROM capsa_metadata WHERE key = ?1", [key])
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let value: String = row.get(0)?;
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_metadata_tx(tx: &Transaction, key: &str) -> Result<Option<String>> {
+        let mut rows = tx
+            .query("SELECT value FROM capsa_metadata WHERE key = ?1", [key])
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let value: String = row.get(0)?;
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn set_metadata_tx(tx: &Transaction, key: &str, value: &str) -> Result<()> {
+        tx.execute(
+            "INSERT INTO capsa_metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn detect_legacy_dimensions_tx(tx: &Transaction) -> Result<Vec<usize>> {
+        let mut rows = tx
+            .query(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name GLOB 'documents_[0-9]*'",
+                (),
+            )
+            .await?;
+
+        let mut dims = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let table_name: String = row.get(0)?;
+            if let Some(raw_dim) = table_name.strip_prefix("documents_") {
+                let dim = raw_dim.parse::<usize>().map_err(|e| {
+                    DatabaseError::SchemaSetup(format!(
+                        "Invalid legacy table name '{}': {}",
+                        table_name, e
+                    ))
+                })?;
+                dims.push(dim);
+            }
+        }
+
+        dims.sort_unstable();
+        dims.dedup();
+        Ok(dims)
+    }
+
+    fn parse_embedding_dim(raw: &str) -> Result<usize> {
+        raw.parse::<usize>().map_err(|e| {
+            DatabaseError::SchemaSetup(format!(
+                "Invalid stored embedding dimension '{}': {}",
+                raw, e
+            ))
+            .into()
+        })
+    }
+
+    async fn validate_metadata(
+        conn: &Connection,
+        expected_dim: usize,
+        expected_model: Option<&str>,
+    ) -> Result<()> {
+        Self::setup_metadata_table(conn).await?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+
+        match Self::get_metadata_tx(&tx, "embedding_dim").await? {
+            Some(raw_dim) => {
+                let stored_dim = Self::parse_embedding_dim(&raw_dim)?;
+                if stored_dim != expected_dim {
+                    return Err(DatabaseError::SchemaSetup(format!(
+                        "Embedding dimension mismatch: database uses {}, requested {}",
+                        stored_dim, expected_dim
+                    ))
+                    .into());
+                }
+            }
+            None => {
+                let legacy_dims = Self::detect_legacy_dimensions_tx(&tx).await?;
+                match legacy_dims.as_slice() {
+                    [] => {}
+                    [legacy_dim] if *legacy_dim == expected_dim => {}
+                    [legacy_dim] => {
+                        return Err(DatabaseError::SchemaSetup(format!(
+                            "Legacy database uses embedding dimension {}, requested {}",
+                            legacy_dim, expected_dim
+                        ))
+                        .into());
+                    }
+                    _ => {
+                        return Err(DatabaseError::SchemaSetup(format!(
+                            "Legacy database contains multiple embedding dimensions: {:?}",
+                            legacy_dims
+                        ))
+                        .into());
+                    }
+                }
+
+                Self::set_metadata_tx(&tx, "embedding_dim", &expected_dim.to_string()).await?;
+            }
+        }
+
+        if let Some(model) = expected_model {
+            match Self::get_metadata_tx(&tx, "embedding_model").await? {
+                Some(stored_model) => {
+                    if stored_model != model {
+                        return Err(DatabaseError::SchemaSetup(format!(
+                            "Embedding model mismatch: database uses '{}', requested '{}'",
+                            stored_model, model
+                        ))
+                        .into());
+                    }
+                }
+                None => {
+                    Self::set_metadata_tx(&tx, "embedding_model", model).await?;
+                }
+            }
+        }
+
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn setup_schema(&self) -> Result<()> {
@@ -207,15 +370,20 @@ impl VectorDatabaseConnection {
     where
         F: FnMut(usize),
     {
+        // Compress content using async LZ4 encoder stream
+        let mut encoder = Lz4Encoder::new(Cursor::new(content.as_bytes()));
+        let mut compressed_content = Vec::new();
+        encoder.read_to_end(&mut compressed_content).await?;
+
         // Wrap everything in a single transaction for atomicity
         let tx = self.conn.transaction().await?;
 
-        // 1. Insert Parent Document
+        // 1. Insert Parent Document with compressed content
         let doc_id: i64 = {
             let mut rows = tx
                 .query(
                     &self.schema.insert_document,
-                    (content.to_string(), metadata.to_string()),
+                    (compressed_content, metadata.to_string()),
                 )
                 .await?;
 
@@ -413,7 +581,13 @@ impl VectorDatabaseConnection {
             .await?;
 
         if let Some(row) = rows.next().await? {
-            let content: String = row.get(0)?;
+            // Decompress content using async LZ4 decoder stream
+            let compressed_content: Vec<u8> = row.get(0)?;
+            let mut decoder = Lz4Decoder::new(Cursor::new(compressed_content));
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed).await?;
+            let content = String::from_utf8(decompressed)?;
+
             let meta_str: String = row.get(1)?;
             let metadata: Value = serde_json::from_str(&meta_str)?;
             Ok(Some((content, metadata)))
@@ -467,8 +641,38 @@ impl VectorDatabase {
     ///
     /// Returns an error if the connection cannot be established.
     pub async fn connect(&self) -> Result<VectorDatabaseConnection> {
+        self.connect_with_model(None).await
+    }
+
+    /// Creates a new connection and validates embedding metadata against the model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection cannot be established or metadata mismatches.
+    pub async fn connect_with_model(
+        &self,
+        expected_model: Option<&str>,
+    ) -> Result<VectorDatabaseConnection> {
         let conn = self.db.connect()?;
-        VectorDatabaseConnection::new(conn, self.schema.clone()).await
+        VectorDatabaseConnection::new(conn, self.schema.clone(), expected_model).await
+    }
+
+    /// Reads the stored embedding dimension from the database metadata table.
+    ///
+    /// Returns `Ok(None)` when the metadata table exists but no dimension is stored yet.
+    pub async fn read_stored_embedding_dim(db_path: &str) -> Result<Option<usize>> {
+        let db = Builder::new_local(db_path).build().await?;
+        let conn = db.connect()?;
+        VectorDatabaseConnection::setup_metadata_table(&conn).await?;
+
+        if let Some(raw_dim) =
+            VectorDatabaseConnection::get_metadata(&conn, "embedding_dim").await?
+        {
+            let dim = VectorDatabaseConnection::parse_embedding_dim(&raw_dim)?;
+            Ok(Some(dim))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -523,6 +727,83 @@ mod db_tests {
         // Verify content by fetching the document
         let (fetched_content, _) = conn.fetch_document(*found_doc_id).await?.unwrap();
         assert_eq!(fetched_content, content);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embedding_dimension_mismatch_rejected() -> Result<()> {
+        let db_uri = "file:dim_mismatch?mode=memory&cache=shared";
+
+        let db_3d = VectorDatabase::new(db_uri, 3).await?;
+        let _conn_3d = db_3d.connect().await?;
+
+        let db_4d = VectorDatabase::new(db_uri, 4).await?;
+        let err = db_4d
+            .connect()
+            .await
+            .expect_err("dimension mismatch should fail");
+
+        assert!(
+            err.to_string().contains("Embedding dimension mismatch"),
+            "unexpected error: {}",
+            err
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embedding_model_mismatch_rejected() -> Result<()> {
+        let db_uri = "file:model_mismatch?mode=memory&cache=shared";
+
+        let db = VectorDatabase::new(db_uri, 3).await?;
+        let _conn = db.connect_with_model(Some("model-a")).await?;
+
+        let err = db
+            .connect_with_model(Some("model-b"))
+            .await
+            .expect_err("model mismatch should fail");
+
+        assert!(
+            err.to_string().contains("Embedding model mismatch"),
+            "unexpected error: {}",
+            err
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_dimension_mismatch_rejected() -> Result<()> {
+        let db_uri = "file:legacy_dim_mismatch?mode=memory&cache=shared";
+
+        // Simulate an older database that has dimension-namespaced tables but no metadata table.
+        let legacy_db = Builder::new_local(db_uri).build().await?;
+        let legacy_conn = legacy_db.connect()?;
+        legacy_conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS documents_3 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    content BLOB,
+                    metadata JSON
+                )",
+                (),
+            )
+            .await?;
+
+        let db_4d = VectorDatabase::new(db_uri, 4).await?;
+        let err = db_4d
+            .connect()
+            .await
+            .expect_err("legacy dimension mismatch should fail");
+
+        assert!(
+            err.to_string()
+                .contains("Legacy database uses embedding dimension 3"),
+            "unexpected error: {}",
+            err
+        );
 
         Ok(())
     }

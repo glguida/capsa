@@ -36,7 +36,7 @@
 
 use crate::config::{Config, EMBEDDING_CONTEXT};
 use crate::embedder::Embedder;
-use crate::error::Result;
+use crate::error::{EmbeddingError, Result};
 use crate::vectordb::{VectorDatabase, VectorDatabaseConnection};
 use std::sync::Arc;
 
@@ -83,10 +83,7 @@ impl DocumentDatabaseConnection {
     /// ```
     pub async fn insert(&self, metadata: serde_json::Value, text: &str) -> Result<DocumentId> {
         let vecs = self.embedder.embed_document(text).await?;
-        let id = self
-            .vconn
-            .insert_document(text.as_ref(), metadata, vecs)
-            .await?;
+        let id = self.vconn.insert_document(text, metadata, vecs).await?;
         Ok(id)
     }
 
@@ -169,6 +166,7 @@ impl DocumentDatabaseConnection {
 pub struct DocumentDatabase {
     embedder: Arc<Embedder>,
     vdb: VectorDatabase,
+    model: Option<String>,
 }
 
 impl DocumentDatabase {
@@ -190,38 +188,36 @@ impl DocumentDatabase {
             config.api_key.clone(),
             EMBEDDING_CONTEXT,
         )?);
+        let probe = embedder.embed_query("test").await?;
+        if probe.is_empty() {
+            return Err(EmbeddingError::NoEmbeddingReturned.into());
+        }
+        let vdb = VectorDatabase::new(&config.db_path, probe.len()).await?;
 
-        // Retrieve vector size by having a test query.
-        let test_vec = embedder.embed_query("test").await?;
-        let vec_size = test_vec.len();
-
-        let vdb = VectorDatabase::new(&config.db_path, vec_size).await?;
-
-        Ok(DocumentDatabase { embedder, vdb })
+        Ok(DocumentDatabase {
+            embedder,
+            vdb,
+            model: Some(config.model.clone()),
+        })
     }
 
     /// Creates a new document database with a custom embedder.
     ///
     /// This constructor is useful for testing with mock embedders.
-    ///
-    /// # Arguments
-    ///
-    /// * `embedder` - An embedder instance to use for generating embeddings
-    /// * `vdb_path` - Path to the vector database file
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database cannot be initialized.
-    pub async fn with_embedder(embedder: Embedder, vdb_path: String) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) async fn with_embedder(embedder: Embedder, vdb_path: String) -> Result<Self> {
         let embedder = Arc::new(embedder);
+        let probe = embedder.embed_query("test").await?;
+        if probe.is_empty() {
+            return Err(EmbeddingError::NoEmbeddingReturned.into());
+        }
+        let vdb = VectorDatabase::new(&vdb_path, probe.len()).await?;
 
-        // Retrieve vector size by having a test query.
-        let test_vec = embedder.embed_query("test").await?;
-        let vec_size = test_vec.len();
-
-        let vdb = VectorDatabase::new(&vdb_path, vec_size).await?;
-
-        Ok(DocumentDatabase { embedder, vdb })
+        Ok(DocumentDatabase {
+            embedder,
+            vdb,
+            model: None,
+        })
     }
 
     /// Creates a new connection to the document database.
@@ -233,7 +229,7 @@ impl DocumentDatabase {
     ///
     /// Returns an error if the database connection cannot be established.
     pub async fn connect(&self) -> Result<DocumentDatabaseConnection> {
-        let vconn = self.vdb.connect().await?;
+        let vconn = self.vdb.connect_with_model(self.model.as_deref()).await?;
         let embedder = self.embedder.clone();
         Ok(DocumentDatabaseConnection { vconn, embedder })
     }
