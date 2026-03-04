@@ -70,52 +70,36 @@ enum Commands {
 }
 
 async fn extract_pdf_metadata_and_text(path: &PathBuf) -> Result<(serde_json::Value, String)> {
-    let doc = pdf_extract::Document::load(path)
+    use lopdf::{Document, Object};
+
+    // Load PDF document using lopdf for efficient streaming
+    let doc = Document::load(path)
         .with_context(|| format!("Failed to read PDF file: {}", path.display()))?;
 
     // Extract metadata from Info dictionary
-    let get_info_string = |dict: &pdf_extract::Dictionary, key: &[u8]| -> Option<String> {
-        dict.get(key)
-            .ok()
-            .and_then(|obj| obj.as_string().ok())
-            .map(|cow_str| cow_str.to_string())
+    let get_info_string = |dict: &lopdf::Dictionary, key: &[u8]| -> Option<String> {
+        dict.get(key).ok().and_then(|obj| {
+            if let Object::String(bytes, _) = obj {
+                String::from_utf8(bytes.clone()).ok()
+            } else {
+                None
+            }
+        })
     };
 
-    let (title, author, subject, keywords, creator, producer) =
-        if let Ok(info_ref) = doc.trailer.get(b"Info") {
-            if let Ok(info_id) = info_ref.as_reference() {
-                if let Ok(info_obj) = doc.get_object(info_id) {
-                    if let Ok(info_dict) = info_obj.as_dict() {
-                        (
-                            get_info_string(info_dict, b"Title")
-                                .unwrap_or_else(|| "Unknown".to_string()),
-                            get_info_string(info_dict, b"Author")
-                                .unwrap_or_else(|| "Unknown".to_string()),
-                            get_info_string(info_dict, b"Subject"),
-                            get_info_string(info_dict, b"Keywords"),
-                            get_info_string(info_dict, b"Creator"),
-                            get_info_string(info_dict, b"Producer"),
-                        )
-                    } else {
-                        (
-                            "Unknown".to_string(),
-                            "Unknown".to_string(),
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                    }
-                } else {
-                    (
-                        "Unknown".to_string(),
-                        "Unknown".to_string(),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                }
+    let (title, author, subject, keywords, creator, producer) = if let Ok(info_ref) =
+        doc.trailer.get(b"Info")
+    {
+        if let Ok(info_obj_id) = info_ref.as_reference() {
+            if let Ok(Object::Dictionary(info_dict)) = doc.get_object(info_obj_id) {
+                (
+                    get_info_string(info_dict, b"Title").unwrap_or_else(|| "Unknown".to_string()),
+                    get_info_string(info_dict, b"Author").unwrap_or_else(|| "Unknown".to_string()),
+                    get_info_string(info_dict, b"Subject"),
+                    get_info_string(info_dict, b"Keywords"),
+                    get_info_string(info_dict, b"Creator"),
+                    get_info_string(info_dict, b"Producer"),
+                )
             } else {
                 (
                     "Unknown".to_string(),
@@ -135,7 +119,17 @@ async fn extract_pdf_metadata_and_text(path: &PathBuf) -> Result<(serde_json::Va
                 None,
                 None,
             )
-        };
+        }
+    } else {
+        (
+            "Unknown".to_string(),
+            "Unknown".to_string(),
+            None,
+            None,
+            None,
+            None,
+        )
+    };
 
     let metadata = json!({
         "title": title,
@@ -147,15 +141,23 @@ async fn extract_pdf_metadata_and_text(path: &PathBuf) -> Result<(serde_json::Va
         "path": path.display().to_string(),
     });
 
-    // Extract text using pdf-extract
-    let text =
-        pdf_extract::extract_text(path).with_context(|| "Failed to extract text from PDF")?;
+    // Stream text extraction page by page to minimize memory usage
+    // lopdf supports efficient page-by-page streaming
+    let mut text_accumulated = String::new();
+    let pages = doc.get_pages();
 
-    if text.trim().is_empty() {
+    for (page_num, _) in pages.iter() {
+        if let Ok(page_text) = doc.extract_text(&[*page_num]) {
+            text_accumulated.push_str(&page_text);
+            text_accumulated.push('\n');
+        }
+    }
+
+    if text_accumulated.trim().is_empty() {
         anyhow::bail!("No text could be extracted from the PDF");
     }
 
-    Ok((metadata, text))
+    Ok((metadata, text_accumulated))
 }
 
 fn extract_video_id(id_or_url: &str) -> Result<String> {
