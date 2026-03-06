@@ -692,69 +692,132 @@ async fn run_serve(bind: String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use lopdf::{Dictionary, Document, Object, Stream};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
-    const ATTENTION_PDF: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/attention-is-all-you-need.pdf");
+    /// Build a synthetic multi-page PDF entirely in memory.
+    ///
+    /// Each page contains a unique marker of the form "MARKER_PAGE_N" so tests
+    /// can verify both content and page ordering.
+    fn make_synthetic_pdf(page_count: usize) -> NamedTempFile {
+        let mut doc = Document::with_version("1.5");
+
+        // Pre-allocate the pages-tree object ID so pages can reference it as parent
+        let pages_id = doc.new_object_id();
+
+        // Helvetica is a standard Type1 font — no embedding required
+        let mut font = Dictionary::new();
+        font.set("Type", Object::Name(b"Font".to_vec()));
+        font.set("Subtype", Object::Name(b"Type1".to_vec()));
+        font.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
+        let font_id = doc.add_object(Object::Dictionary(font));
+
+        let mut fonts_dict = Dictionary::new();
+        fonts_dict.set("F1", Object::Reference(font_id));
+        let mut resources = Dictionary::new();
+        resources.set("Font", Object::Dictionary(fonts_dict));
+
+        let mut page_ids = vec![];
+        for i in 0..page_count {
+            let marker = format!("MARKER_PAGE_{}", i + 1);
+            let content_bytes = format!("BT /F1 12 Tf 72 720 Td ({}) Tj ET", marker).into_bytes();
+            let content_id = doc.add_object(Object::Stream(Stream::new(
+                Dictionary::new(),
+                content_bytes,
+            )));
+
+            let mut page = Dictionary::new();
+            page.set("Type", Object::Name(b"Page".to_vec()));
+            page.set("Parent", Object::Reference(pages_id));
+            page.set(
+                "MediaBox",
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(612),
+                    Object::Integer(792),
+                ]),
+            );
+            page.set("Contents", Object::Reference(content_id));
+            page.set("Resources", Object::Dictionary(resources.clone()));
+            page_ids.push(doc.add_object(Object::Dictionary(page)));
+        }
+
+        let kids: Vec<Object> = page_ids.iter().map(|id| Object::Reference(*id)).collect();
+        let mut pages = Dictionary::new();
+        pages.set("Type", Object::Name(b"Pages".to_vec()));
+        pages.set("Kids", Object::Array(kids));
+        pages.set("Count", Object::Integer(page_count as i64));
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(Object::Dictionary(catalog));
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut tmp = NamedTempFile::new().expect("tempfile");
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).expect("save pdf");
+        tmp.write_all(&buf).expect("write pdf");
+        tmp
+    }
 
     #[test]
     fn test_pdf_extraction_returns_text() {
-        let path = Path::new(ATTENTION_PDF);
+        let tmp = make_synthetic_pdf(20);
         let (metadata, text) =
-            extract_pdf_metadata_and_text_sync(path).expect("extraction should succeed");
+            extract_pdf_metadata_and_text_sync(tmp.path()).expect("extraction should succeed");
 
         assert!(!text.trim().is_empty(), "extracted text must not be empty");
-        assert!(
-            text.len() > 1000,
-            "expected substantial text, got {} bytes",
-            text.len()
-        );
         assert!(
             metadata.get("title").is_some(),
             "metadata must contain a title field"
         );
-    }
-
-    #[test]
-    fn test_pdf_extraction_content() {
-        let path = Path::new(ATTENTION_PDF);
-        let (_, text) = extract_pdf_metadata_and_text_sync(path).unwrap();
-
-        // "Attention Is All You Need" should contain these terms
-        let lower = text.to_lowercase();
-        assert!(lower.contains("attention"), "text should mention attention");
-        assert!(
-            lower.contains("transformer"),
-            "text should mention transformer"
-        );
+        // All 20 pages should contribute text
+        for i in 1..=20 {
+            assert!(
+                text.contains(&format!("MARKER_PAGE_{}", i)),
+                "missing marker for page {}",
+                i
+            );
+        }
     }
 
     #[test]
     fn test_pdf_extraction_page_order() {
-        let path = Path::new(ATTENTION_PDF);
-        let (_, text) = extract_pdf_metadata_and_text_sync(path).unwrap();
+        let tmp = make_synthetic_pdf(30);
+        let (_, text) = extract_pdf_metadata_and_text_sync(tmp.path()).unwrap();
 
-        // Abstract appears before references in a well-ordered paper
-        let abstract_pos = text.to_lowercase().find("abstract");
-        let references_pos = text.to_lowercase().find("references");
-        assert!(
-            abstract_pos.is_some() && references_pos.is_some(),
-            "should find both abstract and references sections"
-        );
-        assert!(
-            abstract_pos.unwrap() < references_pos.unwrap(),
-            "abstract must appear before references (page order must be preserved)"
-        );
+        // Verify pages appear in ascending order by finding each marker's position
+        let positions: Vec<usize> = (1..=30)
+            .map(|i| {
+                text.find(&format!("MARKER_PAGE_{}", i))
+                    .unwrap_or_else(|| panic!("missing marker for page {}", i))
+            })
+            .collect();
+
+        for w in positions.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "page order not preserved: pos {} >= {}",
+                w[0],
+                w[1]
+            );
+        }
     }
 
     #[tokio::test]
     async fn test_pdf_extraction_async() {
-        // Exercises the spawn_blocking wrapper
-        let path = std::path::PathBuf::from(ATTENTION_PDF);
+        // Exercises the spawn_blocking wrapper end-to-end
+        let tmp = make_synthetic_pdf(5);
+        let path = tmp.path().to_path_buf();
         let (_, text) = extract_pdf_metadata_and_text(&path)
             .await
             .expect("async extraction should succeed");
-        assert!(!text.trim().is_empty());
+        assert!(text.contains("MARKER_PAGE_1"));
+        assert!(text.contains("MARKER_PAGE_5"));
     }
 }
 
