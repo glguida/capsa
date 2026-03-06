@@ -689,6 +689,75 @@ async fn run_serve(bind: String) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    const ATTENTION_PDF: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/attention-is-all-you-need.pdf");
+
+    #[test]
+    fn test_pdf_extraction_returns_text() {
+        let path = Path::new(ATTENTION_PDF);
+        let (metadata, text) =
+            extract_pdf_metadata_and_text_sync(path).expect("extraction should succeed");
+
+        assert!(!text.trim().is_empty(), "extracted text must not be empty");
+        assert!(
+            text.len() > 1000,
+            "expected substantial text, got {} bytes",
+            text.len()
+        );
+        assert!(
+            metadata.get("title").is_some(),
+            "metadata must contain a title field"
+        );
+    }
+
+    #[test]
+    fn test_pdf_extraction_content() {
+        let path = Path::new(ATTENTION_PDF);
+        let (_, text) = extract_pdf_metadata_and_text_sync(path).unwrap();
+
+        // "Attention Is All You Need" should contain these terms
+        let lower = text.to_lowercase();
+        assert!(lower.contains("attention"), "text should mention attention");
+        assert!(
+            lower.contains("transformer"),
+            "text should mention transformer"
+        );
+    }
+
+    #[test]
+    fn test_pdf_extraction_page_order() {
+        let path = Path::new(ATTENTION_PDF);
+        let (_, text) = extract_pdf_metadata_and_text_sync(path).unwrap();
+
+        // Abstract appears before references in a well-ordered paper
+        let abstract_pos = text.to_lowercase().find("abstract");
+        let references_pos = text.to_lowercase().find("references");
+        assert!(
+            abstract_pos.is_some() && references_pos.is_some(),
+            "should find both abstract and references sections"
+        );
+        assert!(
+            abstract_pos.unwrap() < references_pos.unwrap(),
+            "abstract must appear before references (page order must be preserved)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pdf_extraction_async() {
+        // Exercises the spawn_blocking wrapper
+        let path = std::path::PathBuf::from(ATTENTION_PDF);
+        let (_, text) = extract_pdf_metadata_and_text(&path)
+            .await
+            .expect("async extraction should succeed");
+        assert!(!text.trim().is_empty());
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
