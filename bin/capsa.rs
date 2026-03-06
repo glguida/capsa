@@ -45,6 +45,12 @@ enum Commands {
     Pdf {
         #[arg(help = "Path to the PDF file")]
         path: PathBuf,
+
+        #[arg(
+            long,
+            help = "Path to a JSON object merged into extracted PDF metadata"
+        )]
+        metadata_json: Option<PathBuf>,
     },
     Yt {
         #[arg(help = "YouTube video ID or URL")]
@@ -160,6 +166,20 @@ async fn extract_pdf_metadata_and_text(path: &PathBuf) -> Result<(serde_json::Va
     Ok((metadata, text_accumulated))
 }
 
+fn merge_metadata(base: &mut serde_json::Value, overlay: serde_json::Value) -> Result<()> {
+    let base_obj = base
+        .as_object_mut()
+        .context("Base metadata must be a JSON object")?;
+    let overlay_obj = overlay
+        .as_object()
+        .context("Overlay metadata must be a JSON object")?;
+
+    for (k, v) in overlay_obj {
+        base_obj.insert(k.clone(), v.clone());
+    }
+    Ok(())
+}
+
 fn extract_video_id(id_or_url: &str) -> Result<String> {
     if id_or_url.len() == 11 && !id_or_url.contains('/') && !id_or_url.contains('&') {
         return Ok(id_or_url.to_string());
@@ -265,7 +285,7 @@ async fn add_yt_document(id_or_url: String, lang: String) -> Result<()> {
     Ok(())
 }
 
-async fn add_pdf_document(path: PathBuf) -> Result<()> {
+async fn add_pdf_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Result<()> {
     println!("================================================================================");
     println!("PDF DOCUMENT INGESTION SYSTEM");
     println!("================================================================================");
@@ -273,7 +293,17 @@ async fn add_pdf_document(path: PathBuf) -> Result<()> {
     println!();
 
     println!("EXTRACTING TEXT...");
-    let (metadata, text) = extract_pdf_metadata_and_text(&path).await?;
+    let (mut metadata, text) = extract_pdf_metadata_and_text(&path).await?;
+
+    if let Some(metadata_path) = metadata_json {
+        let raw = std::fs::read_to_string(&metadata_path).with_context(|| {
+            format!("Failed to read metadata JSON: {}", metadata_path.display())
+        })?;
+        let overlay: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+            format!("Failed to parse metadata JSON: {}", metadata_path.display())
+        })?;
+        merge_metadata(&mut metadata, overlay)?;
+    }
 
     println!("EXTRACTION COMPLETE");
     println!("TEXT SIZE.: {} CHARACTERS", text.len());
@@ -495,8 +525,11 @@ async fn main() -> Result<()> {
     CONFIG.get_or_init(|| Config::new(cli.base_url, cli.model, cli.db_path, api_key));
 
     match cli.command {
-        Commands::Pdf { path } => {
-            add_pdf_document(path).await?;
+        Commands::Pdf {
+            path,
+            metadata_json,
+        } => {
+            add_pdf_document(path, metadata_json).await?;
         }
         Commands::Yt { id_or_url, lang } => {
             add_yt_document(id_or_url, lang).await?;
