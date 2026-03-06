@@ -64,6 +64,16 @@ enum Commands {
         )]
         metadata_json: Option<PathBuf>,
     },
+    Pptx {
+        #[arg(help = "Path to the PPTX file")]
+        path: PathBuf,
+
+        #[arg(
+            long,
+            help = "Path to a JSON object merged into extracted PPTX metadata"
+        )]
+        metadata_json: Option<PathBuf>,
+    },
     Yt {
         #[arg(help = "YouTube video ID or URL")]
         id_or_url: String,
@@ -200,6 +210,232 @@ fn extract_pdf_metadata_and_text_sync(
     }
 
     Ok((metadata, text_accumulated))
+}
+
+async fn extract_pptx_metadata_and_text(
+    path: &std::path::Path,
+) -> Result<(serde_json::Value, String)> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || extract_pptx_metadata_and_text_sync(&path))
+        .await
+        .context("PPTX extraction task panicked")?
+}
+
+fn extract_pptx_metadata_and_text_sync(
+    path: &std::path::Path,
+) -> Result<(serde_json::Value, String)> {
+    use rayon::prelude::*;
+    use std::io::Read;
+    use zip::ZipArchive;
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open PPTX file: {}", path.display()))?;
+    let mut archive =
+        ZipArchive::new(file).context("Failed to read archive — is this a valid PPTX file?")?;
+
+    // Extract core properties from docProps/core.xml
+    let (title, creator) = {
+        let mut title = "Unknown".to_string();
+        let mut creator = "Unknown".to_string();
+        if let Ok(mut entry) = archive.by_name("docProps/core.xml") {
+            let mut xml = String::new();
+            let _ = entry.read_to_string(&mut xml);
+            if let Some(t) = pptx_core_prop(&xml, "title") {
+                title = t;
+            }
+            if let Some(c) = pptx_core_prop(&xml, "creator") {
+                creator = c;
+            }
+        }
+        (title, creator)
+    };
+
+    // Collect slide entry names, sorted by slide number
+    let mut slide_names: Vec<String> = (0..archive.len())
+        .filter_map(|i| {
+            let name = archive.by_index(i).ok()?.name().to_string();
+            if pptx_is_slide(&name) {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    slide_names.sort_by_key(|n| pptx_slide_number(n));
+
+    let slide_count = slide_names.len();
+
+    // Read all slide XMLs sequentially (ZipArchive is not Sync)
+    let slide_xmls: Vec<String> = slide_names
+        .iter()
+        .map(|name| {
+            let mut entry = archive
+                .by_name(name)
+                .with_context(|| format!("Cannot read {}", name))?;
+            let mut xml = String::new();
+            entry.read_to_string(&mut xml)?;
+            Ok(xml)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Parse DrawingML text in parallel
+    let slide_texts: Vec<String> = slide_xmls
+        .par_iter()
+        .map(|xml| pptx_extract_drawingml_text(xml))
+        .collect();
+
+    let text: String = slide_texts
+        .into_iter()
+        .filter(|t| !t.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if text.trim().is_empty() {
+        anyhow::bail!("No text could be extracted from the PPTX");
+    }
+
+    let metadata = json!({
+        "title": title,
+        "creator": creator,
+        "slide_count": slide_count,
+        "path": path.display().to_string(),
+    });
+
+    Ok((metadata, text))
+}
+
+/// Returns true for slide XML entries, excluding relationship sidecars.
+fn pptx_is_slide(name: &str) -> bool {
+    name.starts_with("ppt/slides/slide") && name.ends_with(".xml") && !name.contains("/_rels/")
+}
+
+/// Extracts the numeric suffix from a slide entry name for sorting.
+fn pptx_slide_number(name: &str) -> usize {
+    name.trim_start_matches("ppt/slides/slide")
+        .trim_end_matches(".xml")
+        .parse()
+        .unwrap_or(0)
+}
+
+/// Extracts a Dublin-Core property value from docProps/core.xml by local tag name.
+///
+/// Matches any namespace-prefixed element (`<dc:title>`, `<cp:creator>`, etc.).
+/// Content ends at the first `<` after the opening tag, which is always the
+/// corresponding close tag in well-formed XML.
+fn pptx_core_prop(xml: &str, tag: &str) -> Option<String> {
+    let open = format!(":{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find('<')?;
+    let value = xml[start..start + end].trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+/// Extracts all human-readable text from a DrawingML slide XML.
+///
+/// Iterates over `<a:t>` text runs and flushes accumulated text on each
+/// `</a:p>` paragraph boundary.
+fn pptx_extract_drawingml_text(xml: &str) -> String {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let mut reader = Reader::from_str(xml);
+    let mut result = String::new();
+    let mut current_para = String::new();
+    let mut in_t = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                if e.local_name().as_ref() == b"t" {
+                    in_t = true;
+                }
+            }
+            Ok(Event::Text(ref e)) if in_t => {
+                if let Ok(text) = e.unescape() {
+                    current_para.push_str(&text);
+                }
+            }
+            Ok(Event::End(ref e)) => match e.local_name().as_ref() {
+                b"t" => in_t = false,
+                b"p" => {
+                    let trimmed = current_para.trim();
+                    if !trimmed.is_empty() {
+                        result.push_str(trimmed);
+                        result.push('\n');
+                    }
+                    current_para.clear();
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    result
+}
+
+async fn add_pptx_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Result<()> {
+    println!("================================================================================");
+    println!("PPTX DOCUMENT INGESTION SYSTEM");
+    println!("================================================================================");
+    println!("FILE......: {}", path.display());
+    println!();
+
+    println!("EXTRACTING TEXT...");
+    let (mut metadata, text) = extract_pptx_metadata_and_text(&path).await?;
+
+    if let Some(metadata_path) = metadata_json {
+        let raw = std::fs::read_to_string(&metadata_path).with_context(|| {
+            format!("Failed to read metadata JSON: {}", metadata_path.display())
+        })?;
+        let overlay: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+            format!("Failed to parse metadata JSON: {}", metadata_path.display())
+        })?;
+        merge_metadata(&mut metadata, overlay)?;
+    }
+
+    println!("EXTRACTION COMPLETE");
+    println!("TEXT SIZE.: {} CHARACTERS", text.len());
+    println!(
+        "TITLE.....: {}",
+        metadata
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("N/A")
+    );
+    println!(
+        "CREATOR...: {}",
+        metadata
+            .get("creator")
+            .and_then(|v| v.as_str())
+            .unwrap_or("N/A")
+    );
+    println!(
+        "SLIDES....: {}",
+        metadata
+            .get("slide_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+    println!();
+
+    print!("INITIALIZING DATABASE CONNECTION...");
+    let db = DocumentDatabase::new(CONFIG.get().expect("Config not initialized")).await?;
+    let conn = db.connect().await?;
+    println!(" DONE");
+    println!();
+
+    print!("PROCESSING...");
+    let doc_id = conn.insert(metadata, &text).await?;
+    println!(" COMPLETE");
+
+    println!();
+    println!("================================================================================");
+    println!("INGESTION COMPLETE - DOCID={:06}", doc_id);
+    println!("================================================================================");
+
+    Ok(())
 }
 
 fn merge_metadata(base: &mut serde_json::Value, overlay: serde_json::Value) -> Result<()> {
@@ -819,6 +1055,121 @@ mod tests {
         assert!(text.contains("MARKER_PAGE_1"));
         assert!(text.contains("MARKER_PAGE_5"));
     }
+
+    /// Build a synthetic PPTX (ZIP) in memory with `slide_count` slides.
+    ///
+    /// Each slide XML contains a single paragraph with "SLIDE_N_TEXT".
+    fn make_synthetic_pptx(slide_count: usize) -> NamedTempFile {
+        use std::io::Write as _;
+
+        let tmp = NamedTempFile::new().expect("tempfile");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path())
+            .expect("open tempfile");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        // docProps/core.xml — minimal Dublin Core metadata
+        zip.start_file("docProps/core.xml", options).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+  xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:title>Synthetic Presentation</dc:title>
+  <dc:creator>Test Author</dc:creator>
+</cp:coreProperties>"#,
+        )
+        .unwrap();
+
+        // One slide XML per slide
+        for i in 1..=slide_count {
+            let name = format!("ppt/slides/slide{}.xml", i);
+            zip.start_file(name, options).unwrap();
+            let xml = format!(
+                r#"<?xml version="1.0"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld><p:spTree>
+    <p:sp><p:txBody>
+      <a:p><a:r><a:t>SLIDE_{}_TEXT</a:t></a:r></a:p>
+    </p:txBody></p:sp>
+  </p:spTree></p:cSld>
+</p:sld>"#,
+                i
+            );
+            zip.write_all(xml.as_bytes()).unwrap();
+        }
+
+        zip.finish().unwrap();
+        tmp
+    }
+
+    #[test]
+    fn test_pptx_extraction_returns_text() {
+        let tmp = make_synthetic_pptx(10);
+        let (metadata, text) =
+            extract_pptx_metadata_and_text_sync(tmp.path()).expect("extraction should succeed");
+
+        assert!(!text.trim().is_empty(), "extracted text must not be empty");
+        assert_eq!(
+            metadata.get("title").and_then(|v| v.as_str()),
+            Some("Synthetic Presentation")
+        );
+        assert_eq!(
+            metadata.get("creator").and_then(|v| v.as_str()),
+            Some("Test Author")
+        );
+        assert_eq!(
+            metadata.get("slide_count").and_then(|v| v.as_u64()),
+            Some(10)
+        );
+        for i in 1..=10 {
+            assert!(
+                text.contains(&format!("SLIDE_{}_TEXT", i)),
+                "missing text for slide {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_pptx_extraction_slide_order() {
+        let tmp = make_synthetic_pptx(20);
+        let (_, text) = extract_pptx_metadata_and_text_sync(tmp.path()).unwrap();
+
+        let positions: Vec<usize> = (1..=20)
+            .map(|i| {
+                text.find(&format!("SLIDE_{}_TEXT", i))
+                    .unwrap_or_else(|| panic!("missing text for slide {}", i))
+            })
+            .collect();
+
+        for w in positions.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "slide order not preserved: pos {} >= {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pptx_extraction_async() {
+        let tmp = make_synthetic_pptx(5);
+        let path = tmp.path().to_path_buf();
+        let (metadata, text) = extract_pptx_metadata_and_text(&path)
+            .await
+            .expect("async extraction should succeed");
+        assert!(text.contains("SLIDE_1_TEXT"));
+        assert!(text.contains("SLIDE_5_TEXT"));
+        assert_eq!(
+            metadata.get("slide_count").and_then(|v| v.as_u64()),
+            Some(5)
+        );
+    }
 }
 
 #[tokio::main]
@@ -840,6 +1191,12 @@ async fn main() -> Result<()> {
             metadata_json,
         } => {
             add_pdf_document(path, metadata_json).await?;
+        }
+        Commands::Pptx {
+            path,
+            metadata_json,
+        } => {
+            add_pptx_document(path, metadata_json).await?;
         }
         Commands::Yt { id_or_url, lang } => {
             add_yt_document(id_or_url, lang).await?;

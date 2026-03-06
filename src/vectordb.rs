@@ -13,7 +13,6 @@ use libsql::{Builder, Connection, Database, Transaction, TransactionBehavior};
 use serde_json::Value;
 use std::sync::Arc;
 
-
 #[derive(Debug)]
 struct VectorDatabaseSchema {
     vec_size: usize,
@@ -142,7 +141,11 @@ impl VectorDatabaseConnection {
 
         Self::validate_metadata(&conn, schema.vec_size, expected_model).await?;
 
-        let db = Self { conn, schema, executor };
+        let db = Self {
+            conn,
+            schema,
+            executor,
+        };
         db.setup_schema().await?;
 
         Ok(db)
@@ -380,8 +383,7 @@ impl VectorDatabaseConnection {
                 use std::io::Write;
                 let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
                 enc.write_all(&bytes)?;
-                enc.finish()
-                    .map_err(|e| std::io::Error::other(e).into())
+                enc.finish().map_err(|e| std::io::Error::other(e).into())
             })
             .await?;
 
@@ -392,11 +394,12 @@ impl VectorDatabaseConnection {
             .map(|(i, (v, s, e))| (i, v, s, e))
             .collect();
         let serialized: Vec<Result<(usize, String, usize, usize)>> =
-            self.executor.par_map(indexed, |(i, vec, chunk_start, chunk_end)| {
-                serde_json::to_string(&vec)
-                    .map(|json| (i, json, chunk_start, chunk_end))
-                    .map_err(Into::into)
-            });
+            self.executor
+                .par_map(indexed, |(i, vec, chunk_start, chunk_end)| {
+                    serde_json::to_string(&vec)
+                        .map(|json| (i, json, chunk_start, chunk_end))
+                        .map_err(Into::into)
+                });
 
         // Wrap everything in a single transaction for atomicity
         let tx = self.conn.transaction().await?;
@@ -658,14 +661,14 @@ impl VectorDatabase {
     /// # Errors
     ///
     /// Returns an error if the database cannot be created or opened.
-    pub async fn new(
-        db_path: &str,
-        vec_size: usize,
-        executor: Executor,
-    ) -> Result<Self> {
+    pub async fn new(db_path: &str, vec_size: usize, executor: Executor) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
         let schema = Arc::new(VectorDatabaseSchema::new(vec_size));
-        Ok(VectorDatabase { db, schema, executor })
+        Ok(VectorDatabase {
+            db,
+            schema,
+            executor,
+        })
     }
 
     /// Creates a new connection to the vector database.
@@ -689,7 +692,8 @@ impl VectorDatabase {
         expected_model: Option<&str>,
     ) -> Result<VectorDatabaseConnection> {
         let conn = self.db.connect()?;
-        VectorDatabaseConnection::new(conn, self.schema.clone(), self.executor, expected_model).await
+        VectorDatabaseConnection::new(conn, self.schema.clone(), self.executor, expected_model)
+            .await
     }
 
     /// Reads the stored embedding dimension from the database metadata table.
@@ -1417,7 +1421,9 @@ mod parallel_executor_tests {
         let metadata = json!({"executor": "parallel"});
         let embeddings = add_offsets(vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]]);
 
-        let doc_id = conn.insert_document(content, metadata.clone(), embeddings).await?;
+        let doc_id = conn
+            .insert_document(content, metadata.clone(), embeddings)
+            .await?;
         assert!(doc_id > 0);
 
         let (fetched_content, fetched_meta) = conn.fetch_document(doc_id).await?.unwrap();
@@ -1441,7 +1447,9 @@ mod parallel_executor_tests {
             .await?;
         }
 
-        let results = conn.search_topk_with_distance(vec![0.0, 1.0, 0.0], 3).await?;
+        let results = conn
+            .search_topk_with_distance(vec![0.0, 1.0, 0.0], 3)
+            .await?;
         assert_eq!(results.len(), 3);
 
         // Distances must be in ascending order
@@ -1495,7 +1503,11 @@ mod parallel_executor_tests {
             .collect();
 
         let doc_id = conn
-            .insert_document("Many chunks doc", json!({"chunks": 50}), add_offsets(chunks))
+            .insert_document(
+                "Many chunks doc",
+                json!({"chunks": 50}),
+                add_offsets(chunks),
+            )
             .await?;
         assert!(doc_id > 0);
 
