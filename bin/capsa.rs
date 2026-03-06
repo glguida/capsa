@@ -1,12 +1,23 @@
 use anyhow::{Context, Result};
+use axum::Router;
 use capsa::config::Config;
 use capsa::documentdb::DocumentDatabase;
 use clap::{Parser, Subcommand};
 use lru::LruCache;
+use rmcp::{
+    ErrorData as McpError, ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::*,
+    schemars, tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
+};
 use serde_json::json;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use yt_transcript_rs::YouTubeTranscriptApi;
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -72,6 +83,14 @@ enum Commands {
             help = "Number of top results to return"
         )]
         top_k: usize,
+    },
+    Serve {
+        #[arg(
+            long,
+            default_value = "127.0.0.1:10080",
+            help = "Address to bind the MCP server"
+        )]
+        bind: String,
     },
 }
 
@@ -514,6 +533,165 @@ async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<(
     Ok(())
 }
 
+// --- MCP Server ---
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SearchRequest {
+    /// Natural language query to search for
+    query: String,
+    /// Number of results to return (default: 5)
+    top_k: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FetchDocumentRequest {
+    /// Document ID as returned by the search tool
+    doc_id: i64,
+}
+
+#[derive(Clone)]
+struct CapsaServer {
+    conn: Arc<tokio::sync::Mutex<capsa::documentdb::DocumentDatabaseConnection>>,
+    tool_router: ToolRouter<CapsaServer>,
+}
+
+#[tool_router]
+impl CapsaServer {
+    fn new(conn: Arc<tokio::sync::Mutex<capsa::documentdb::DocumentDatabaseConnection>>) -> Self {
+        Self {
+            conn,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    #[tool(
+        description = "Search the document database for content semantically matching a query. Returns ranked chunks with similarity scores, metadata, and the matched text."
+    )]
+    async fn search(
+        &self,
+        Parameters(req): Parameters<SearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().await;
+
+        let results = conn
+            .search_topk_with_distance(&req.query, req.top_k.unwrap_or(5))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let mut doc_cache: HashMap<i64, String> = HashMap::new();
+        let mut formatted = Vec::new();
+
+        for (doc_id, metadata, distance, chunk_start, chunk_end) in &results {
+            if !doc_cache.contains_key(doc_id)
+                && let Ok(Some((content, _))) = conn.fetch_document(*doc_id).await
+            {
+                doc_cache.insert(*doc_id, content);
+            }
+            let chunk = doc_cache.get(doc_id).map(|content| {
+                let start = *chunk_start as usize;
+                let end = (*chunk_end as usize).min(content.len());
+                content[start..end].to_string()
+            });
+            formatted.push(json!({
+                "doc_id": doc_id,
+                "similarity_pct": ((1.0 - distance) * 10000.0).round() / 100.0,
+                "metadata": metadata,
+                "chunk": chunk,
+                "chunk_start": chunk_start,
+                "chunk_end": chunk_end,
+            }));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            json!({ "results": formatted }).to_string(),
+        )]))
+    }
+
+    #[tool(description = "Fetch the full text content and metadata of a document by its ID.")]
+    async fn fetch_document(
+        &self,
+        Parameters(req): Parameters<FetchDocumentRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().await;
+
+        match conn
+            .fetch_document(req.doc_id)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        {
+            Some((content, metadata)) => Ok(CallToolResult::success(vec![Content::text(
+                json!({
+                    "doc_id": req.doc_id,
+                    "metadata": metadata,
+                    "content": content,
+                })
+                .to_string(),
+            )])),
+            None => Ok(CallToolResult::success(vec![Content::text(
+                json!({ "error": format!("document {} not found", req.doc_id) }).to_string(),
+            )])),
+        }
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for CapsaServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::from_build_env())
+    }
+}
+
+async fn run_serve(bind: String) -> Result<()> {
+    println!("================================================================================");
+    println!("CAPSA MCP SERVER");
+    println!("================================================================================");
+    println!("BIND......: {}", bind);
+    println!();
+
+    print!("INITIALIZING DATABASE CONNECTION...");
+    let db = DocumentDatabase::new(CONFIG.get().expect("Config not initialized")).await?;
+    let conn = Arc::new(tokio::sync::Mutex::new(db.connect().await?));
+    println!(" DONE");
+    println!();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::DEBUG.into()),
+        )
+        .init();
+
+    println!("LISTENING ON http://{}/", bind);
+    println!("================================================================================");
+
+    let ct = tokio_util::sync::CancellationToken::new();
+    let service = StreamableHttpService::new(
+        {
+            let conn = conn.clone();
+            move || Ok(CapsaServer::new(conn.clone()))
+        },
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig {
+            cancellation_token: ct.child_token(),
+            ..Default::default()
+        },
+    );
+
+    let router = Router::new()
+        .fallback_service(service)
+        .layer(tower_http::trace::TraceLayer::new_for_http());
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.unwrap();
+            ct.cancel();
+        })
+        .await?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -540,6 +718,9 @@ async fn main() -> Result<()> {
             top_k,
         } => {
             ask_query(query, distance, top_k).await?;
+        }
+        Commands::Serve { bind } => {
+            run_serve(bind).await?;
         }
     }
 
