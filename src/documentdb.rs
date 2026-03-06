@@ -192,7 +192,7 @@ impl DocumentDatabase {
         if probe.is_empty() {
             return Err(EmbeddingError::NoEmbeddingReturned.into());
         }
-        let vdb = VectorDatabase::new(&config.db_path, probe.len()).await?;
+        let vdb = VectorDatabase::new(&config.db_path, probe.len(), config.executor).await?;
 
         Ok(DocumentDatabase {
             embedder,
@@ -206,12 +206,13 @@ impl DocumentDatabase {
     /// This constructor is useful for testing with mock embedders.
     #[cfg(test)]
     pub(crate) async fn with_embedder(embedder: Embedder, vdb_path: String) -> Result<Self> {
+        use crate::executor::Executor;
         let embedder = Arc::new(embedder);
         let probe = embedder.embed_query("test").await?;
         if probe.is_empty() {
             return Err(EmbeddingError::NoEmbeddingReturned.into());
         }
-        let vdb = VectorDatabase::new(&vdb_path, probe.len()).await?;
+        let vdb = VectorDatabase::new(&vdb_path, probe.len(), Executor::sequential()).await?;
 
         Ok(DocumentDatabase {
             embedder,

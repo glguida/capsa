@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use axum::Router;
 use capsa::config::Config;
 use capsa::documentdb::DocumentDatabase;
+use capsa::executor::Executor;
 use clap::{Parser, Subcommand};
 use lru::LruCache;
 use rmcp::{
@@ -404,26 +405,7 @@ async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<(
                 println!(
                     "================================================================================"
                 );
-                println!(
-                    "TITLE..: {}",
-                    metadata
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("N/A")
-                );
-                println!(
-                    "AUTHOR.: {}",
-                    metadata
-                        .get("author")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("N/A")
-                );
-                if let Some(subject) = metadata.get("subject").and_then(|v| v.as_str()) {
-                    println!("SUBJECT: {}", subject);
-                }
-                if let Some(path) = metadata.get("path").and_then(|v| v.as_str()) {
-                    println!("FILE...: {}", path);
-                }
+                print_metadata(metadata);
                 println!(
                     "OFFSET.: {}-{} ({} BYTES)",
                     chunk_start,
@@ -474,26 +456,7 @@ async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<(
                 println!(
                     "================================================================================"
                 );
-                println!(
-                    "TITLE..: {}",
-                    metadata
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("N/A")
-                );
-                println!(
-                    "AUTHOR.: {}",
-                    metadata
-                        .get("author")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("N/A")
-                );
-                if let Some(subject) = metadata.get("subject").and_then(|v| v.as_str()) {
-                    println!("SUBJECT: {}", subject);
-                }
-                if let Some(path) = metadata.get("path").and_then(|v| v.as_str()) {
-                    println!("FILE...: {}", path);
-                }
+                print_metadata(metadata);
                 println!(
                     "OFFSET.: {}-{} ({} BYTES)",
                     chunk_start,
@@ -531,6 +494,24 @@ async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<(
     }
 
     Ok(())
+}
+
+fn print_metadata(metadata: &serde_json::Value) {
+    if let Some(obj) = metadata.as_object() {
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        for key in keys {
+            let value = &obj[key];
+            let display = match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => continue,
+                other => other.to_string(),
+            };
+            if !display.is_empty() {
+                println!("{}: {}", key.to_uppercase(), display);
+            }
+        }
+    }
 }
 
 // --- MCP Server ---
@@ -700,7 +681,10 @@ async fn main() -> Result<()> {
     let api_key = std::env::var("CAPSA_API_KEY")
         .ok()
         .map(secrecy::SecretString::from);
-    CONFIG.get_or_init(|| Config::new(cli.base_url, cli.model, cli.db_path, api_key));
+    CONFIG.get_or_init(|| {
+        Config::new(cli.base_url, cli.model, cli.db_path, api_key)
+            .with_executor(Executor::parallel())
+    });
 
     match cli.command {
         Commands::Pdf {

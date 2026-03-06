@@ -8,11 +8,11 @@
 //! module which handles embedding generation automatically.
 
 use crate::error::{DatabaseError, Result};
-use async_compression::futures::bufread::{Lz4Decoder, Lz4Encoder};
-use futures::io::{AsyncReadExt, Cursor};
+use crate::executor::Executor;
 use libsql::{Builder, Connection, Database, Transaction, TransactionBehavior};
 use serde_json::Value;
 use std::sync::Arc;
+
 
 #[derive(Debug)]
 struct VectorDatabaseSchema {
@@ -108,6 +108,7 @@ impl VectorDatabaseSchema {
 pub struct VectorDatabaseConnection {
     conn: Connection,
     schema: Arc<VectorDatabaseSchema>,
+    executor: Executor,
 }
 
 impl VectorDatabaseConnection {
@@ -118,6 +119,7 @@ impl VectorDatabaseConnection {
     async fn new(
         conn: Connection,
         schema: Arc<VectorDatabaseSchema>,
+        executor: Executor,
         expected_model: Option<&str>,
     ) -> Result<Self> {
         // Enable WAL mode for better performance and concurrency
@@ -140,7 +142,7 @@ impl VectorDatabaseConnection {
 
         Self::validate_metadata(&conn, schema.vec_size, expected_model).await?;
 
-        let db = Self { conn, schema };
+        let db = Self { conn, schema, executor };
         db.setup_schema().await?;
 
         Ok(db)
@@ -370,10 +372,31 @@ impl VectorDatabaseConnection {
     where
         F: FnMut(usize),
     {
-        // Compress content using async LZ4 encoder stream
-        let mut encoder = Lz4Encoder::new(Cursor::new(content.as_bytes()));
-        let mut compressed_content = Vec::new();
-        encoder.read_to_end(&mut compressed_content).await?;
+        // Compress content using lz4_flex inside spawn_blocking
+        let bytes = content.as_bytes().to_vec();
+        let compressed_content = self
+            .executor
+            .spawn_blocking(move || -> Result<Vec<u8>> {
+                use std::io::Write;
+                let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+                enc.write_all(&bytes)?;
+                enc.finish()
+                    .map_err(|e| std::io::Error::other(e).into())
+            })
+            .await?;
+
+        // Serialize vectors to JSON in parallel before entering the transaction
+        let indexed: Vec<(usize, Vec<f32>, usize, usize)> = embeddings
+            .into_iter()
+            .enumerate()
+            .map(|(i, (v, s, e))| (i, v, s, e))
+            .collect();
+        let serialized: Vec<Result<(usize, String, usize, usize)>> =
+            self.executor.par_map(indexed, |(i, vec, chunk_start, chunk_end)| {
+                serde_json::to_string(&vec)
+                    .map(|json| (i, json, chunk_start, chunk_end))
+                    .map_err(Into::into)
+            });
 
         // Wrap everything in a single transaction for atomicity
         let tx = self.conn.transaction().await?;
@@ -394,8 +417,8 @@ impl VectorDatabaseConnection {
         };
 
         // 2. Insert Vectors with offsets in same transaction
-        for (i, (vec, chunk_start, chunk_end)) in embeddings.into_iter().enumerate() {
-            let vec_json = serde_json::to_string(&vec)?;
+        for result in serialized {
+            let (i, vec_json, chunk_start, chunk_end) = result?;
             tx.execute(
                 &self.schema.insert_vectors,
                 (
@@ -581,12 +604,18 @@ impl VectorDatabaseConnection {
             .await?;
 
         if let Some(row) = rows.next().await? {
-            // Decompress content using async LZ4 decoder stream
+            // Decompress content using lz4_flex inside spawn_blocking
             let compressed_content: Vec<u8> = row.get(0)?;
-            let mut decoder = Lz4Decoder::new(Cursor::new(compressed_content));
-            let mut decompressed = Vec::new();
-            decoder.read_to_end(&mut decompressed).await?;
-            let content = String::from_utf8(decompressed)?;
+            let content = self
+                .executor
+                .spawn_blocking(move || -> Result<String> {
+                    use std::io::Read;
+                    let mut dec = lz4_flex::frame::FrameDecoder::new(&compressed_content[..]);
+                    let mut decompressed = Vec::new();
+                    dec.read_to_end(&mut decompressed)?;
+                    String::from_utf8(decompressed).map_err(Into::into)
+                })
+                .await?;
 
             let meta_str: String = row.get(1)?;
             let metadata: Value = serde_json::from_str(&meta_str)?;
@@ -614,6 +643,7 @@ impl VectorDatabaseConnection {
 pub struct VectorDatabase {
     db: Database,
     schema: Arc<VectorDatabaseSchema>,
+    executor: Executor,
 }
 
 impl VectorDatabase {
@@ -623,14 +653,19 @@ impl VectorDatabase {
     ///
     /// * `db_path` - Path to the database file, or ":memory:" for in-memory database
     /// * `vec_size` - Dimensionality of the embedding vectors
+    /// * `executor` - Executor for CPU-bound parallel work
     ///
     /// # Errors
     ///
     /// Returns an error if the database cannot be created or opened.
-    pub async fn new(db_path: &str, vec_size: usize) -> Result<Self> {
+    pub async fn new(
+        db_path: &str,
+        vec_size: usize,
+        executor: Executor,
+    ) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
         let schema = Arc::new(VectorDatabaseSchema::new(vec_size));
-        Ok(VectorDatabase { db, schema })
+        Ok(VectorDatabase { db, schema, executor })
     }
 
     /// Creates a new connection to the vector database.
@@ -654,7 +689,7 @@ impl VectorDatabase {
         expected_model: Option<&str>,
     ) -> Result<VectorDatabaseConnection> {
         let conn = self.db.connect()?;
-        VectorDatabaseConnection::new(conn, self.schema.clone(), expected_model).await
+        VectorDatabaseConnection::new(conn, self.schema.clone(), self.executor, expected_model).await
     }
 
     /// Reads the stored embedding dimension from the database metadata table.
@@ -681,6 +716,10 @@ mod db_tests {
     use super::*;
     use serde_json::json;
 
+    fn seq() -> Executor {
+        Executor::sequential()
+    }
+
     // Helper function to add dummy offsets to embeddings for testing
     fn add_offsets(embeddings: Vec<Vec<f32>>) -> Vec<(Vec<f32>, usize, usize)> {
         embeddings
@@ -694,7 +733,7 @@ mod db_tests {
     async fn test_full_flow() -> Result<()> {
         // 1. Initialize an in-memory database
         // ":memory:" ensures no files are created on disk during testing
-        let db = VectorDatabase::new(":memory:", 3).await?;
+        let db = VectorDatabase::new(":memory:", 3, seq()).await?;
         let conn = db.connect().await?;
 
         // 2. Prepare mock data
@@ -735,10 +774,10 @@ mod db_tests {
     async fn test_embedding_dimension_mismatch_rejected() -> Result<()> {
         let db_uri = "file:dim_mismatch?mode=memory&cache=shared";
 
-        let db_3d = VectorDatabase::new(db_uri, 3).await?;
+        let db_3d = VectorDatabase::new(db_uri, 3, seq()).await?;
         let _conn_3d = db_3d.connect().await?;
 
-        let db_4d = VectorDatabase::new(db_uri, 4).await?;
+        let db_4d = VectorDatabase::new(db_uri, 4, seq()).await?;
         let err = db_4d
             .connect()
             .await
@@ -757,7 +796,7 @@ mod db_tests {
     async fn test_embedding_model_mismatch_rejected() -> Result<()> {
         let db_uri = "file:model_mismatch?mode=memory&cache=shared";
 
-        let db = VectorDatabase::new(db_uri, 3).await?;
+        let db = VectorDatabase::new(db_uri, 3, seq()).await?;
         let _conn = db.connect_with_model(Some("model-a")).await?;
 
         let err = db
@@ -792,7 +831,7 @@ mod db_tests {
             )
             .await?;
 
-        let db_4d = VectorDatabase::new(db_uri, 4).await?;
+        let db_4d = VectorDatabase::new(db_uri, 4, seq()).await?;
         let err = db_4d
             .connect()
             .await
@@ -810,7 +849,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_cascade_delete() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 2).await?;
+        let db = VectorDatabase::new(":memory:", 2, seq()).await?;
         let conn = db.connect().await?;
 
         // Insert a doc with 2 chunks
@@ -841,7 +880,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_multiple_documents_search_ordering() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 3).await?;
+        let db = VectorDatabase::new(":memory:", 3, seq()).await?;
         let conn = db.connect().await?;
 
         // Insert 3 documents with different similarity to our query
@@ -890,7 +929,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_search_empty_database() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 3).await?;
+        let db = VectorDatabase::new(":memory:", 3, seq()).await?;
         let conn = db.connect().await?;
 
         let results = conn
@@ -904,7 +943,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_multiple_chunks_per_document() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 4).await?;
+        let db = VectorDatabase::new(":memory:", 4, seq()).await?;
         let conn = db.connect().await?;
 
         // Insert a document with 5 chunks
@@ -956,7 +995,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_search_limit_parameter() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 2).await?;
+        let db = VectorDatabase::new(":memory:", 2, seq()).await?;
         let conn = db.connect().await?;
 
         // Insert 10 documents
@@ -988,7 +1027,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_complex_metadata() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 3).await?;
+        let db = VectorDatabase::new(":memory:", 3, seq()).await?;
         let conn = db.connect().await?;
 
         let complex_metadata = json!({
@@ -1031,7 +1070,7 @@ mod db_tests {
     #[tokio::test]
     async fn test_realistic_embedding_dimensions() -> Result<()> {
         // Test with common embedding dimensions (384 from sentence-transformers)
-        let db = VectorDatabase::new(":memory:", 384).await?;
+        let db = VectorDatabase::new(":memory:", 384, seq()).await?;
         let conn = db.connect().await?;
 
         let mut embedding = vec![0.0; 384];
@@ -1064,7 +1103,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_zero_vectors() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 3).await?;
+        let db = VectorDatabase::new(":memory:", 3, seq()).await?;
         let conn = db.connect().await?;
 
         // Insert a document with a zero vector
@@ -1091,7 +1130,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_duplicate_documents() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 3).await?;
+        let db = VectorDatabase::new(":memory:", 3, seq()).await?;
         let conn = db.connect().await?;
 
         // Insert the same content twice
@@ -1129,7 +1168,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_normalized_vs_unnormalized_vectors() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 3).await?;
+        let db = VectorDatabase::new(":memory:", 3, seq()).await?;
         let conn = db.connect().await?;
 
         // Insert normalized vector
@@ -1164,7 +1203,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_empty_embeddings_list() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 3).await?;
+        let db = VectorDatabase::new(":memory:", 3, seq()).await?;
         let conn = db.connect().await?;
 
         // Insert a document with no embeddings
@@ -1189,7 +1228,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_all_search_functions_consistency() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 3).await?;
+        let db = VectorDatabase::new(":memory:", 3, seq()).await?;
         let conn = db.connect().await?;
 
         // Insert 5 documents with different similarity to query [1, 0, 0]
@@ -1297,7 +1336,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_concurrent_inserts() -> Result<()> {
-        let db = VectorDatabase::new(":memory:", 3).await?;
+        let db = VectorDatabase::new(":memory:", 3, seq()).await?;
         let conn = db.connect().await?;
 
         // Insert multiple documents sequentially (simulating concurrent operations)
@@ -1335,7 +1374,7 @@ mod db_tests {
         // Test that WAL mode is enabled on file-based databases
         let temp_dir = tempfile::tempdir()?;
         let db_path = temp_dir.path().join("test_wal.db");
-        let db = VectorDatabase::new(db_path.to_str().unwrap(), 3).await?;
+        let db = VectorDatabase::new(db_path.to_str().unwrap(), 3, seq()).await?;
         let conn = db.connect().await?;
 
         // Query the journal_mode to verify WAL is enabled
@@ -1346,6 +1385,123 @@ mod db_tests {
             "Expected journal_mode to be 'wal' but got '{}'",
             mode
         );
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod parallel_executor_tests {
+    use super::*;
+    use crate::executor::Executor;
+    use serde_json::json;
+
+    fn par() -> Executor {
+        Executor::parallel()
+    }
+
+    fn add_offsets(embeddings: Vec<Vec<f32>>) -> Vec<(Vec<f32>, usize, usize)> {
+        embeddings
+            .into_iter()
+            .enumerate()
+            .map(|(i, vec)| (vec, i * 100, (i + 1) * 100))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_parallel_insert_and_fetch() -> Result<()> {
+        let db = VectorDatabase::new(":memory:", 3, par()).await?;
+        let conn = db.connect().await?;
+
+        let content = "Parallel executor test document";
+        let metadata = json!({"executor": "parallel"});
+        let embeddings = add_offsets(vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]]);
+
+        let doc_id = conn.insert_document(content, metadata.clone(), embeddings).await?;
+        assert!(doc_id > 0);
+
+        let (fetched_content, fetched_meta) = conn.fetch_document(doc_id).await?.unwrap();
+        assert_eq!(fetched_content, content);
+        assert_eq!(fetched_meta["executor"], "parallel");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parallel_search() -> Result<()> {
+        let db = VectorDatabase::new(":memory:", 3, par()).await?;
+        let conn = db.connect().await?;
+
+        for i in 0..5 {
+            conn.insert_document(
+                &format!("Document {}", i),
+                json!({"index": i}),
+                add_offsets(vec![vec![i as f32 / 5.0, 1.0 - i as f32 / 5.0, 0.0]]),
+            )
+            .await?;
+        }
+
+        let results = conn.search_topk_with_distance(vec![0.0, 1.0, 0.0], 3).await?;
+        assert_eq!(results.len(), 3);
+
+        // Distances must be in ascending order
+        for i in 0..results.len() - 1 {
+            assert!(results[i].2 <= results[i + 1].2);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parallel_large_embedding() -> Result<()> {
+        // Exercise spawn_blocking and par_map with a realistic embedding size
+        let db = VectorDatabase::new(":memory:", 768, par()).await?;
+        let conn = db.connect().await?;
+
+        let embedding: Vec<f32> = (0..768).map(|i| (i as f32) / 768.0).collect();
+        let embeddings = add_offsets(vec![embedding.clone(), {
+            let mut v = embedding.clone();
+            v[0] = 0.5;
+            v
+        }]);
+
+        let doc_id = conn
+            .insert_document("Large parallel doc", json!({}), embeddings)
+            .await?;
+        assert!(doc_id > 0);
+
+        let results = conn.search_topk(embedding, 1).await?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, doc_id);
+
+        let (content, _) = conn.fetch_document(doc_id).await?.unwrap();
+        assert_eq!(content, "Large parallel doc");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parallel_many_chunks() -> Result<()> {
+        // Many chunks exercises par_map with non-trivial parallelism
+        let db = VectorDatabase::new(":memory:", 4, par()).await?;
+        let conn = db.connect().await?;
+
+        let chunks: Vec<Vec<f32>> = (0..50)
+            .map(|i| {
+                let mut v = vec![0.0f32; 4];
+                v[i % 4] = 1.0;
+                v
+            })
+            .collect();
+
+        let doc_id = conn
+            .insert_document("Many chunks doc", json!({"chunks": 50}), add_offsets(chunks))
+            .await?;
+        assert!(doc_id > 0);
+
+        let results = conn.search_topk(vec![1.0, 0.0, 0.0, 0.0], 10).await?;
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|(id, _, _, _)| *id == doc_id));
 
         Ok(())
     }

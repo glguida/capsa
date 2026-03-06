@@ -38,7 +38,8 @@ lru = "0.12"
 yt-transcript-rs = "0.1.8"
 thiserror = "2.0"
 secrecy = "0.10.3"
-async-compression = { version = "0.4", features = ["lz4", "futures-io"] }
+lz4_flex = { version = "0.11", features = ["frame"] }
+rayon = "1"
 rmcp = { version = "1.1.0", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = { version = "0.8", features = ["http1", "tokio"] }
 tokio-util = "0.7"

@@ -1,5 +1,6 @@
 //! Configuration constants for the embedding system.
 
+use crate::executor::Executor;
 use secrecy::SecretString;
 
 /// The maximum context size in tokens for text embeddings.
@@ -20,10 +21,12 @@ pub struct Config {
     pub db_path: String,
     /// Optional API key for authentication
     pub api_key: Option<SecretString>,
+    /// Executor used for CPU-bound parallel work (defaults to sequential)
+    pub executor: Executor,
 }
 
 impl Config {
-    /// Creates a new configuration.
+    /// Creates a new configuration with a [`SequentialExecutor`].
     ///
     /// # Arguments
     ///
@@ -42,7 +45,14 @@ impl Config {
             model,
             db_path,
             api_key,
+            executor: Executor::sequential(),
         }
+    }
+
+    /// Override the executor used for CPU-bound parallel work.
+    pub fn with_executor(mut self, executor: Executor) -> Self {
+        self.executor = executor;
+        self
     }
 }
 

@@ -59,6 +59,7 @@ pub mod config;
 pub mod documentdb;
 pub mod embedder;
 pub mod error;
+pub mod executor;
 pub mod vectordb;
 
 #[cfg(test)]
