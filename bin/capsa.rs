@@ -95,10 +95,21 @@ enum Commands {
     },
 }
 
-async fn extract_pdf_metadata_and_text(path: &PathBuf) -> Result<(serde_json::Value, String)> {
-    use lopdf::{Document, Object};
+async fn extract_pdf_metadata_and_text(
+    path: &std::path::Path,
+) -> Result<(serde_json::Value, String)> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || extract_pdf_metadata_and_text_sync(&path))
+        .await
+        .context("PDF extraction task panicked")?
+}
 
-    // Load PDF document using lopdf for efficient streaming
+fn extract_pdf_metadata_and_text_sync(
+    path: &std::path::Path,
+) -> Result<(serde_json::Value, String)> {
+    use lopdf::{Document, Object};
+    use rayon::prelude::*;
+
     let doc = Document::load(path)
         .with_context(|| format!("Failed to read PDF file: {}", path.display()))?;
 
@@ -167,17 +178,22 @@ async fn extract_pdf_metadata_and_text(path: &PathBuf) -> Result<(serde_json::Va
         "path": path.display().to_string(),
     });
 
-    // Stream text extraction page by page to minimize memory usage
-    // lopdf supports efficient page-by-page streaming
-    let mut text_accumulated = String::new();
+    // Extract text from all pages in parallel, then reassemble in page order
     let pages = doc.get_pages();
+    let mut page_texts: Vec<(u32, String)> = pages
+        .par_iter()
+        .filter_map(|(page_num, _)| {
+            doc.extract_text(&[*page_num])
+                .ok()
+                .map(|text| (*page_num, text))
+        })
+        .collect();
+    page_texts.sort_unstable_by_key(|(n, _)| *n);
 
-    for (page_num, _) in pages.iter() {
-        if let Ok(page_text) = doc.extract_text(&[*page_num]) {
-            text_accumulated.push_str(&page_text);
-            text_accumulated.push('\n');
-        }
-    }
+    let text_accumulated: String = page_texts
+        .into_iter()
+        .flat_map(|(_, text)| [text, "\n".to_string()])
+        .collect();
 
     if text_accumulated.trim().is_empty() {
         anyhow::bail!("No text could be extracted from the PDF");
