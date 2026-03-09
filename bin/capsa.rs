@@ -3,6 +3,7 @@ use axum::Router;
 use capsa::config::Config;
 use capsa::documentdb::DocumentDatabase;
 use capsa::executor::Executor;
+use capsa::queue::{Queue, queue_db_path};
 use clap::{Parser, Subcommand};
 use lru::LruCache;
 use rmcp::{
@@ -103,6 +104,8 @@ enum Commands {
         )]
         bind: String,
     },
+    /// Show the current state of the ingestion pipeline queue.
+    Status,
 }
 
 async fn extract_pdf_metadata_and_text(
@@ -420,19 +423,18 @@ async fn add_pptx_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Res
     );
     println!();
 
-    print!("INITIALIZING DATABASE CONNECTION...");
-    let db = DocumentDatabase::new(CONFIG.get().expect("Config not initialized")).await?;
-    let conn = db.connect().await?;
+    print!("OPENING QUEUE...");
+    let config = CONFIG.get().expect("Config not initialized");
+    let queue = Queue::new(&queue_db_path(&config.db_path)).await?;
+    let conn = queue.connect().await?;
     println!(" DONE");
     println!();
 
-    print!("PROCESSING...");
-    let doc_id = conn.insert(metadata, &text).await?;
-    println!(" COMPLETE");
+    conn.enqueue("", &metadata, &text).await?;
 
     println!();
     println!("================================================================================");
-    println!("INGESTION COMPLETE - DOCID={:06}", doc_id);
+    println!("QUEUED FOR INGESTION");
     println!("================================================================================");
 
     Ok(())
@@ -538,20 +540,18 @@ async fn add_yt_document(id_or_url: String, lang: String) -> Result<()> {
         "language": transcript.language,
     });
 
-    print!("INITIALIZING DATABASE CONNECTION...");
-    let db = DocumentDatabase::new(CONFIG.get().expect("Config not initialized")).await?;
-
-    let conn = db.connect().await?;
+    print!("OPENING QUEUE...");
+    let config = CONFIG.get().expect("Config not initialized");
+    let queue = Queue::new(&queue_db_path(&config.db_path)).await?;
+    let conn = queue.connect().await?;
     println!(" DONE");
     println!();
 
-    print!("PROCESSING...");
-    let doc_id = conn.insert(metadata, &text).await?;
-    println!(" COMPLETE");
+    conn.enqueue("", &metadata, &text).await?;
 
     println!();
     println!("================================================================================");
-    println!("INGESTION COMPLETE - DOCID={:06}", doc_id);
+    println!("QUEUED FOR INGESTION");
     println!("================================================================================");
 
     Ok(())
@@ -595,20 +595,18 @@ async fn add_pdf_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Resu
     );
     println!();
 
-    print!("INITIALIZING DATABASE CONNECTION...");
-    let db = DocumentDatabase::new(CONFIG.get().expect("Config not initialized")).await?;
-
-    let conn = db.connect().await?;
+    print!("OPENING QUEUE...");
+    let config = CONFIG.get().expect("Config not initialized");
+    let queue = Queue::new(&queue_db_path(&config.db_path)).await?;
+    let conn = queue.connect().await?;
     println!(" DONE");
     println!();
 
-    print!("PROCESSING...");
-    let doc_id = conn.insert(metadata, &text).await?;
-    println!(" COMPLETE");
+    conn.enqueue("", &metadata, &text).await?;
 
     println!();
     println!("================================================================================");
-    println!("INGESTION COMPLETE - DOCID={:06}", doc_id);
+    println!("QUEUED FOR INGESTION");
     println!("================================================================================");
 
     Ok(())
@@ -626,7 +624,7 @@ async fn ask_query(query: String, show_distance: bool, top_k: usize) -> Result<(
     use std::io::Write;
     std::io::stdout().flush()?;
 
-    let db = DocumentDatabase::new(CONFIG.get().expect("Config not initialized")).await?;
+    let db = DocumentDatabase::new_reader(CONFIG.get().expect("Config not initialized")).await?;
 
     let conn = db.connect().await?;
     println!(" DONE");
@@ -873,6 +871,37 @@ impl ServerHandler for CapsaServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
     }
+}
+
+async fn show_status() -> Result<()> {
+    let config = CONFIG.get().expect("Config not initialized");
+    let queue = Queue::new(&queue_db_path(&config.db_path)).await?;
+    let conn = queue.connect().await?;
+
+    let status = conn.status_counts().await?;
+    println!("================================================================================");
+    println!("PIPELINE STATUS");
+    println!("================================================================================");
+    println!("  PENDING.....: {}", status.pending);
+    println!("  PROCESSING..: {}", status.processing);
+    println!("  DONE........: {}", status.done);
+    println!("  FAILED......: {}", status.failed);
+
+    let failed = conn.failed_items().await?;
+    if !failed.is_empty() {
+        println!();
+        println!("FAILED ITEMS");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
+        for item in failed {
+            println!("  job_id={} source={}", item.job_id, item.source);
+            println!("  error: {}", item.error);
+            println!();
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_serve(bind: String) -> Result<()> {
@@ -1210,6 +1239,9 @@ async fn main() -> Result<()> {
         }
         Commands::Serve { bind } => {
             run_serve(bind).await?;
+        }
+        Commands::Status => {
+            show_status().await?;
         }
     }
 
