@@ -433,7 +433,8 @@ async fn add_pptx_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Res
     println!(" DONE");
     println!();
 
-    conn.enqueue("", &metadata, &text).await?;
+    conn.enqueue(&format!("pptx:{}", path.display()), &metadata, &text)
+        .await?;
 
     println!();
     println!("================================================================================");
@@ -550,7 +551,8 @@ async fn add_yt_document(id_or_url: String, lang: String) -> Result<()> {
     println!(" DONE");
     println!();
 
-    conn.enqueue("", &metadata, &text).await?;
+    conn.enqueue(&format!("yt:{}", video_id), &metadata, &text)
+        .await?;
 
     println!();
     println!("================================================================================");
@@ -605,7 +607,8 @@ async fn add_pdf_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Resu
     println!(" DONE");
     println!();
 
-    conn.enqueue("", &metadata, &text).await?;
+    conn.enqueue(&format!("pdf:{}", path.display()), &metadata, &text)
+        .await?;
 
     println!();
     println!("================================================================================");
