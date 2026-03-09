@@ -780,6 +780,15 @@ struct FetchDocumentRequest {
     doc_id: i64,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct IngestRequest {
+    /// Full text content to index
+    text: String,
+    /// Document metadata as a JSON object. All fields are optional and free-form.
+    /// Common fields: "title", "author", "source", "url", "date", "language".
+    metadata: serde_json::Value,
+}
+
 #[derive(Clone)]
 struct CapsaServer {
     conn: Arc<tokio::sync::Mutex<capsa::documentdb::DocumentDatabaseConnection>>,
@@ -835,6 +844,22 @@ impl CapsaServer {
 
         Ok(CallToolResult::success(vec![Content::text(
             json!({ "results": formatted }).to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Add a document to the ingestion queue. Chunking, embedding, and indexing happen asynchronously in the background."
+    )]
+    async fn ingest(
+        &self,
+        Parameters(req): Parameters<IngestRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().await;
+        conn.insert(req.metadata, &req.text)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            "queued for ingestion",
         )]))
     }
 
