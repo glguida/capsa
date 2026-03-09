@@ -103,6 +103,9 @@ enum Commands {
             help = "Address to bind the MCP server"
         )]
         bind: String,
+
+        #[arg(long, help = "Enable write access (exposes the ingest MCP tool)")]
+        rw: bool,
     },
     /// Show the current state of the ingestion pipeline queue.
     Status,
@@ -766,6 +769,8 @@ fn print_metadata(metadata: &serde_json::Value) {
 
 // --- MCP Server ---
 
+type CapsaConn = Arc<tokio::sync::Mutex<capsa::documentdb::DocumentDatabaseConnection>>;
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SearchRequest {
     /// Natural language query to search for
@@ -789,15 +794,92 @@ struct IngestRequest {
     metadata: serde_json::Value,
 }
 
+// ── Shared tool logic ────────────────────────────────────────────────────────
+
+async fn mcp_search(
+    conn: &capsa::documentdb::DocumentDatabaseConnection,
+    req: SearchRequest,
+) -> Result<CallToolResult, McpError> {
+    let results = conn
+        .search_topk_with_distance(&req.query, req.top_k.unwrap_or(5))
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+    let mut doc_cache: HashMap<i64, String> = HashMap::new();
+    let mut formatted = Vec::new();
+
+    for (doc_id, metadata, distance, chunk_start, chunk_end) in &results {
+        if !doc_cache.contains_key(doc_id)
+            && let Ok(Some((content, _))) = conn.fetch_document(*doc_id).await
+        {
+            doc_cache.insert(*doc_id, content);
+        }
+        let chunk = doc_cache.get(doc_id).map(|content| {
+            let start = *chunk_start as usize;
+            let end = (*chunk_end as usize).min(content.len());
+            content[start..end].to_string()
+        });
+        formatted.push(json!({
+            "doc_id": doc_id,
+            "similarity_pct": ((1.0 - distance) * 10000.0).round() / 100.0,
+            "metadata": metadata,
+            "chunk": chunk,
+            "chunk_start": chunk_start,
+            "chunk_end": chunk_end,
+        }));
+    }
+
+    Ok(CallToolResult::success(vec![Content::text(
+        json!({ "results": formatted }).to_string(),
+    )]))
+}
+
+async fn mcp_fetch_document(
+    conn: &capsa::documentdb::DocumentDatabaseConnection,
+    req: FetchDocumentRequest,
+) -> Result<CallToolResult, McpError> {
+    match conn
+        .fetch_document(req.doc_id)
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+    {
+        Some((content, metadata)) => Ok(CallToolResult::success(vec![Content::text(
+            json!({
+                "doc_id": req.doc_id,
+                "metadata": metadata,
+                "content": content,
+            })
+            .to_string(),
+        )])),
+        None => Ok(CallToolResult::success(vec![Content::text(
+            json!({ "error": format!("document {} not found", req.doc_id) }).to_string(),
+        )])),
+    }
+}
+
+async fn mcp_ingest(
+    conn: &capsa::documentdb::DocumentDatabaseConnection,
+    req: IngestRequest,
+) -> Result<CallToolResult, McpError> {
+    conn.insert(req.metadata, &req.text)
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+    Ok(CallToolResult::success(vec![Content::text(
+        "queued for ingestion",
+    )]))
+}
+
+// ── Read-only server (default) ───────────────────────────────────────────────
+
 #[derive(Clone)]
-struct CapsaServer {
-    conn: Arc<tokio::sync::Mutex<capsa::documentdb::DocumentDatabaseConnection>>,
-    tool_router: ToolRouter<CapsaServer>,
+struct CapsaServerRO {
+    conn: CapsaConn,
+    tool_router: ToolRouter<CapsaServerRO>,
 }
 
 #[tool_router]
-impl CapsaServer {
-    fn new(conn: Arc<tokio::sync::Mutex<capsa::documentdb::DocumentDatabaseConnection>>) -> Self {
+impl CapsaServerRO {
+    fn new(conn: CapsaConn) -> Self {
         Self {
             conn,
             tool_router: Self::tool_router(),
@@ -812,39 +894,62 @@ impl CapsaServer {
         Parameters(req): Parameters<SearchRequest>,
     ) -> Result<CallToolResult, McpError> {
         let conn = self.conn.lock().await;
+        mcp_search(&conn, req).await
+    }
 
-        let results = conn
-            .search_topk_with_distance(&req.query, req.top_k.unwrap_or(5))
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+    #[tool(description = "Fetch the full text content and metadata of a document by its ID.")]
+    async fn fetch_document(
+        &self,
+        Parameters(req): Parameters<FetchDocumentRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().await;
+        mcp_fetch_document(&conn, req).await
+    }
+}
 
-        let mut doc_cache: HashMap<i64, String> = HashMap::new();
-        let mut formatted = Vec::new();
+#[tool_handler]
+impl ServerHandler for CapsaServerRO {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::from_build_env())
+    }
+}
 
-        for (doc_id, metadata, distance, chunk_start, chunk_end) in &results {
-            if !doc_cache.contains_key(doc_id)
-                && let Ok(Some((content, _))) = conn.fetch_document(*doc_id).await
-            {
-                doc_cache.insert(*doc_id, content);
-            }
-            let chunk = doc_cache.get(doc_id).map(|content| {
-                let start = *chunk_start as usize;
-                let end = (*chunk_end as usize).min(content.len());
-                content[start..end].to_string()
-            });
-            formatted.push(json!({
-                "doc_id": doc_id,
-                "similarity_pct": ((1.0 - distance) * 10000.0).round() / 100.0,
-                "metadata": metadata,
-                "chunk": chunk,
-                "chunk_start": chunk_start,
-                "chunk_end": chunk_end,
-            }));
+// ── Read-write server (--rw) ─────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct CapsaServer {
+    conn: CapsaConn,
+    tool_router: ToolRouter<CapsaServer>,
+}
+
+#[tool_router]
+impl CapsaServer {
+    fn new(conn: CapsaConn) -> Self {
+        Self {
+            conn,
+            tool_router: Self::tool_router(),
         }
+    }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            json!({ "results": formatted }).to_string(),
-        )]))
+    #[tool(
+        description = "Search the document database for content semantically matching a query. Returns ranked chunks with similarity scores, metadata, and the matched text."
+    )]
+    async fn search(
+        &self,
+        Parameters(req): Parameters<SearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().await;
+        mcp_search(&conn, req).await
+    }
+
+    #[tool(description = "Fetch the full text content and metadata of a document by its ID.")]
+    async fn fetch_document(
+        &self,
+        Parameters(req): Parameters<FetchDocumentRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().await;
+        mcp_fetch_document(&conn, req).await
     }
 
     #[tool(
@@ -855,38 +960,7 @@ impl CapsaServer {
         Parameters(req): Parameters<IngestRequest>,
     ) -> Result<CallToolResult, McpError> {
         let conn = self.conn.lock().await;
-        conn.insert(req.metadata, &req.text)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(
-            "queued for ingestion",
-        )]))
-    }
-
-    #[tool(description = "Fetch the full text content and metadata of a document by its ID.")]
-    async fn fetch_document(
-        &self,
-        Parameters(req): Parameters<FetchDocumentRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let conn = self.conn.lock().await;
-
-        match conn
-            .fetch_document(req.doc_id)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        {
-            Some((content, metadata)) => Ok(CallToolResult::success(vec![Content::text(
-                json!({
-                    "doc_id": req.doc_id,
-                    "metadata": metadata,
-                    "content": content,
-                })
-                .to_string(),
-            )])),
-            None => Ok(CallToolResult::success(vec![Content::text(
-                json!({ "error": format!("document {} not found", req.doc_id) }).to_string(),
-            )])),
-        }
+        mcp_ingest(&conn, req).await
     }
 }
 
@@ -929,16 +1003,20 @@ async fn show_status() -> Result<()> {
     Ok(())
 }
 
-async fn run_serve(bind: String) -> Result<()> {
+async fn run_serve(bind: String, rw: bool) -> Result<()> {
     println!("================================================================================");
     println!("CAPSA MCP SERVER");
     println!("================================================================================");
     println!("BIND......: {}", bind);
+    println!(
+        "MODE......: {}",
+        if rw { "READ-WRITE" } else { "READ-ONLY" }
+    );
     println!();
 
     print!("INITIALIZING DATABASE CONNECTION...");
     let db = DocumentDatabase::new(CONFIG.get().expect("Config not initialized")).await?;
-    let conn = Arc::new(tokio::sync::Mutex::new(db.connect().await?));
+    let conn: CapsaConn = Arc::new(tokio::sync::Mutex::new(db.connect().await?));
     println!(" DONE");
     println!();
 
@@ -953,28 +1031,51 @@ async fn run_serve(bind: String) -> Result<()> {
     println!("================================================================================");
 
     let ct = tokio_util::sync::CancellationToken::new();
-    let service = StreamableHttpService::new(
-        {
-            let conn = conn.clone();
-            move || Ok(CapsaServer::new(conn.clone()))
-        },
-        LocalSessionManager::default().into(),
-        StreamableHttpServerConfig {
-            cancellation_token: ct.child_token(),
-            ..Default::default()
-        },
-    );
-
-    let router = Router::new()
-        .fallback_service(service)
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+    let server_config = StreamableHttpServerConfig {
+        cancellation_token: ct.child_token(),
+        ..Default::default()
+    };
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            tokio::signal::ctrl_c().await.unwrap();
-            ct.cancel();
-        })
+    let shutdown = async move {
+        tokio::signal::ctrl_c().await.unwrap();
+        ct.cancel();
+    };
+
+    if rw {
+        let service = StreamableHttpService::new(
+            {
+                let conn = conn.clone();
+                move || Ok(CapsaServer::new(conn.clone()))
+            },
+            LocalSessionManager::default().into(),
+            server_config,
+        );
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback_service(service)
+                .layer(tower_http::trace::TraceLayer::new_for_http()),
+        )
+        .with_graceful_shutdown(shutdown)
         .await?;
+    } else {
+        let service = StreamableHttpService::new(
+            {
+                let conn = conn.clone();
+                move || Ok(CapsaServerRO::new(conn.clone()))
+            },
+            LocalSessionManager::default().into(),
+            server_config,
+        );
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback_service(service)
+                .layer(tower_http::trace::TraceLayer::new_for_http()),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    }
 
     Ok(())
 }
@@ -1262,8 +1363,8 @@ async fn main() -> Result<()> {
         } => {
             ask_query(query, distance, top_k).await?;
         }
-        Commands::Serve { bind } => {
-            run_serve(bind).await?;
+        Commands::Serve { bind, rw } => {
+            run_serve(bind, rw).await?;
         }
         Commands::Status => {
             show_status().await?;
