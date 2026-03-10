@@ -57,9 +57,23 @@ pub struct PipelineStatus {
 #[derive(Debug, Clone)]
 pub struct FailedItem {
     pub job_id: i64,
+    pub display_name: String,
     pub source: String,
     pub error: String,
     pub created_at: i64,
+}
+
+/// A brief summary of an item in an intermediate pipeline stage (for verbose status).
+#[derive(Debug, Clone)]
+pub struct StageItem {
+    /// Human-readable name derived from metadata when available.
+    pub display_name: String,
+    /// Size in bytes of the stage's primary payload.
+    pub size: usize,
+    /// Secondary payload size in bytes when useful for diagnostics.
+    pub aux_size: Option<usize>,
+    /// Number of chunks associated with the item, if known.
+    pub chunk_count: Option<usize>,
 }
 
 /// An item awaiting embedding, sitting in the pending_embeds table.
@@ -172,6 +186,41 @@ pub struct QueueConnection {
 }
 
 impl QueueConnection {
+    fn display_name_from_metadata(metadata: &Value, source: &str) -> String {
+        for key in ["drive_name", "title", "name"] {
+            if let Some(name) = metadata.get(key).and_then(Value::as_str) {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() && trimmed != "Unknown" {
+                    return trimmed.to_string();
+                }
+            }
+        }
+
+        if let Some(path) = metadata.get("path").and_then(Value::as_str)
+            && let Some(name) = Self::basename(path)
+        {
+            return name;
+        }
+
+        if let Some((_, raw)) = source.split_once(':')
+            && let Some(name) = Self::basename(raw)
+        {
+            return name;
+        }
+
+        Self::basename(source).unwrap_or_else(|| source.to_string())
+    }
+
+    fn basename(raw: &str) -> Option<String> {
+        let path = raw.trim().trim_end_matches('/').split('?').next()?;
+        let name = Path::new(path).file_name()?.to_str()?.trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
     /// Enqueues a document for ingestion and returns its job ID.
     pub async fn enqueue(&self, source: &str, metadata: &Value, text: &str) -> Result<i64> {
         let metadata_str = serde_json::to_string(metadata)?;
@@ -362,7 +411,7 @@ impl QueueConnection {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, source, COALESCE(error, ''), created_at \
+                "SELECT id, source, metadata, COALESCE(error, ''), created_at \
                  FROM capsa_queue WHERE status = 'failed' ORDER BY created_at DESC",
                 (),
             )
@@ -370,14 +419,68 @@ impl QueueConnection {
 
         let mut items = Vec::new();
         while let Some(row) = rows.next().await? {
+            let source: String = row.get(1)?;
+            let metadata_str: String = row.get(2)?;
+            let metadata: Value = serde_json::from_str(&metadata_str)?;
             items.push(FailedItem {
                 job_id: row.get(0)?,
-                source: row.get(1)?,
-                error: row.get(2)?,
-                created_at: row.get(3)?,
+                display_name: Self::display_name_from_metadata(&metadata, &source),
+                source,
+                error: row.get(3)?,
+                created_at: row.get(4)?,
             });
         }
 
+        Ok(items)
+    }
+
+    /// Returns all items currently waiting to be embedded (chunked stage), ordered by id.
+    pub async fn chunked_items(&self) -> Result<Vec<StageItem>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT source, metadata, LENGTH(text), json_array_length(chunks)
+                 FROM pending_embeds ORDER BY id",
+                (),
+            )
+            .await?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let source: String = row.get(0)?;
+            let metadata_str: String = row.get(1)?;
+            let metadata: Value = serde_json::from_str(&metadata_str)?;
+            items.push(StageItem {
+                display_name: Self::display_name_from_metadata(&metadata, &source),
+                size: row.get::<i64>(2)? as usize,
+                aux_size: None,
+                chunk_count: Some(row.get::<i64>(3)? as usize),
+            });
+        }
+        Ok(items)
+    }
+
+    /// Returns all items currently waiting to be written (embedded stage), ordered by id.
+    pub async fn embedded_items(&self) -> Result<Vec<StageItem>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT source, metadata, LENGTH(embeddings), LENGTH(compressed_text)
+                 FROM pending_writes ORDER BY id",
+                (),
+            )
+            .await?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let source: String = row.get(0)?;
+            let metadata_str: String = row.get(1)?;
+            let metadata: Value = serde_json::from_str(&metadata_str)?;
+            items.push(StageItem {
+                display_name: Self::display_name_from_metadata(&metadata, &source),
+                size: row.get::<i64>(2)? as usize,
+                aux_size: Some(row.get::<i64>(3)? as usize),
+                chunk_count: None,
+            });
+        }
         Ok(items)
     }
 
@@ -826,6 +929,77 @@ mod tests {
         assert_eq!(write.queue_id, id);
         assert_eq!(write.compressed_text, vec![1, 2, 3]);
         assert_eq!(write.embeddings_blob, vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn test_chunked_items_use_display_name_and_chunk_count() {
+        let q = make_queue().await;
+        let conn = q.connect().await.unwrap();
+        let metadata = json!({
+            "title": "Unknown",
+            "drive_name": "real-name.pdf",
+        });
+        let id = conn
+            .enqueue("pdf:/tmp/random.pdf", &metadata, "text")
+            .await
+            .unwrap();
+        let chunks = vec![
+            ("search_document: first".to_string(), 0usize, 5usize),
+            ("search_document: second".to_string(), 6usize, 12usize),
+        ];
+
+        conn.promote_to_embeds(id, "pdf:/tmp/random.pdf", &metadata, "text", &chunks)
+            .await
+            .unwrap();
+
+        let items = conn.chunked_items().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].display_name, "real-name.pdf");
+        assert_eq!(items[0].size, 4);
+        assert_eq!(items[0].chunk_count, Some(2));
+        assert_eq!(items[0].aux_size, None);
+    }
+
+    #[tokio::test]
+    async fn test_embedded_items_report_embedding_size_and_display_name() {
+        let q = make_queue().await;
+        let conn = q.connect().await.unwrap();
+        let metadata = json!({
+            "title": "spreadsheet-name.xlsx",
+        });
+        let id = conn
+            .enqueue("xls:/tmp/random.xlsx", &metadata, "spreadsheet text")
+            .await
+            .unwrap();
+        let chunks = vec![("search_document: row".to_string(), 0usize, 3usize)];
+
+        conn.promote_to_embeds(
+            id,
+            "xls:/tmp/random.xlsx",
+            &metadata,
+            "spreadsheet text",
+            &chunks,
+        )
+        .await
+        .unwrap();
+        let embed_id = conn.peek_embed().await.unwrap().unwrap().id;
+        conn.promote_to_writes(
+            embed_id,
+            id,
+            "xls:/tmp/random.xlsx",
+            &metadata,
+            vec![1, 2, 3, 4],
+            vec![9; 32],
+        )
+        .await
+        .unwrap();
+
+        let items = conn.embedded_items().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].display_name, "spreadsheet-name.xlsx");
+        assert_eq!(items[0].size, 32);
+        assert_eq!(items[0].aux_size, Some(4));
+        assert_eq!(items[0].chunk_count, None);
     }
 
     #[tokio::test]

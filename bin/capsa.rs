@@ -75,6 +75,20 @@ enum Commands {
         )]
         metadata_json: Option<PathBuf>,
     },
+    Txt {
+        #[arg(help = "Path to the plain text file")]
+        path: PathBuf,
+
+        #[arg(long, help = "Path to a JSON object merged into the document metadata")]
+        metadata_json: Option<PathBuf>,
+    },
+    Xls {
+        #[arg(help = "Path to the spreadsheet file (.xls, .xlsx, .ods)")]
+        path: PathBuf,
+
+        #[arg(long, help = "Path to a JSON object merged into the document metadata")]
+        metadata_json: Option<PathBuf>,
+    },
     Yt {
         #[arg(help = "YouTube video ID or URL")]
         id_or_url: String,
@@ -108,7 +122,13 @@ enum Commands {
         rw: bool,
     },
     /// Show the current state of the ingestion pipeline queue.
-    Status,
+    Status {
+        #[arg(
+            long,
+            help = "List individual files in each active stage with their sizes"
+        )]
+        verbose: bool,
+    },
     /// Re-queue all failed ingestion jobs so they are retried.
     Retry,
 }
@@ -446,6 +466,16 @@ async fn add_pptx_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Res
     Ok(())
 }
 
+fn format_size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 fn merge_metadata(base: &mut serde_json::Value, overlay: serde_json::Value) -> Result<()> {
     let base_obj = base
         .as_object_mut()
@@ -615,6 +645,243 @@ async fn add_pdf_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Resu
     println!();
     println!("================================================================================");
     println!("QUEUED FOR INGESTION");
+    println!("================================================================================");
+
+    Ok(())
+}
+
+async fn add_txt_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Result<()> {
+    println!("================================================================================");
+    println!("TEXT DOCUMENT INGESTION SYSTEM");
+    println!("================================================================================");
+    println!("FILE......: {}", path.display());
+    println!();
+
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read text file: {}", path.display()))?;
+
+    let title = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let mut metadata = serde_json::json!({ "title": title });
+
+    if let Some(metadata_path) = metadata_json {
+        let raw = std::fs::read_to_string(&metadata_path).with_context(|| {
+            format!("Failed to read metadata JSON: {}", metadata_path.display())
+        })?;
+        let overlay: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+            format!("Failed to parse metadata JSON: {}", metadata_path.display())
+        })?;
+        merge_metadata(&mut metadata, overlay)?;
+    }
+
+    println!("TEXT SIZE.: {} CHARACTERS", text.len());
+    println!(
+        "TITLE.....: {}",
+        metadata
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("N/A")
+    );
+    println!();
+
+    print!("OPENING QUEUE...");
+    let config = CONFIG.get().expect("Config not initialized");
+    let queue = Queue::new(&queue_db_path(&config.db_path)).await?;
+    let conn = queue.connect().await?;
+    println!(" DONE");
+    println!();
+
+    let queue_id = conn
+        .enqueue(&format!("txt:{}", path.display()), &metadata, &text)
+        .await?;
+
+    println!();
+    println!("================================================================================");
+    println!("QUEUED FOR INGESTION  DOCID={}", queue_id);
+    println!("================================================================================");
+
+    Ok(())
+}
+
+fn col_letter(i: usize) -> String {
+    let mut s = String::new();
+    let mut n = i;
+    loop {
+        s.insert(0, (b'A' + (n % 26) as u8) as char);
+        if n < 26 {
+            break;
+        }
+        n = n / 26 - 1;
+    }
+    s
+}
+
+fn xls_cell_to_string(cell: &calamine::Data) -> String {
+    use calamine::Data;
+    match cell {
+        Data::String(s) => s.trim().to_string(),
+        Data::Float(f) => {
+            if f.fract() == 0.0 && f.abs() < 1e15 {
+                format!("{}", *f as i64)
+            } else {
+                format!("{}", f)
+            }
+        }
+        Data::Int(i) => i.to_string(),
+        Data::Bool(b) => b.to_string(),
+        Data::DateTimeIso(s) => s.clone(),
+        Data::DurationIso(s) => s.clone(),
+        Data::DateTime(_) | Data::Error(_) | Data::Empty => String::new(),
+    }
+}
+
+fn extract_xls_text_sync(path: &std::path::Path) -> Result<(serde_json::Value, String)> {
+    use calamine::{Reader, open_workbook_auto};
+
+    let mut workbook = open_workbook_auto(path)
+        .with_context(|| format!("Failed to open spreadsheet: {}", path.display()))?;
+
+    let sheet_names = workbook.sheet_names().to_vec();
+    let title = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let mut text = String::new();
+    let mut total_sheets = 0usize;
+    let mut total_rows = 0usize;
+
+    for sheet_name in &sheet_names {
+        let range = match workbook.worksheet_range(sheet_name) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        if range.is_empty() {
+            continue;
+        }
+
+        let rows: Vec<&[calamine::Data]> = range.rows().collect();
+        if rows.is_empty() {
+            continue;
+        }
+
+        total_sheets += 1;
+        text.push_str(&format!("=== Sheet: {} ===\n", sheet_name));
+
+        // First row is treated as column headers.
+        let headers: Vec<String> = rows[0]
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let s = xls_cell_to_string(cell);
+                if s.is_empty() { col_letter(i) } else { s }
+            })
+            .collect();
+
+        // Format each subsequent row as "Header: Value | Header: Value".
+        for row in rows.iter().skip(1) {
+            let parts: Vec<String> = headers
+                .iter()
+                .zip(row.iter())
+                .filter_map(|(header, cell)| {
+                    let val = xls_cell_to_string(cell);
+                    if val.is_empty() {
+                        None
+                    } else {
+                        Some(format!("{}: {}", header, val))
+                    }
+                })
+                .collect();
+
+            if !parts.is_empty() {
+                text.push_str(&parts.join(" | "));
+                text.push('\n');
+                total_rows += 1;
+            }
+        }
+
+        text.push('\n');
+    }
+
+    let metadata = serde_json::json!({
+        "title": title,
+        "sheet_count": total_sheets,
+        "row_count": total_rows,
+    });
+
+    Ok((metadata, text))
+}
+
+async fn extract_xls_text(path: &std::path::Path) -> Result<(serde_json::Value, String)> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || extract_xls_text_sync(&path))
+        .await
+        .context("Spreadsheet extraction task panicked")?
+}
+
+async fn add_xls_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Result<()> {
+    println!("================================================================================");
+    println!("SPREADSHEET INGESTION SYSTEM");
+    println!("================================================================================");
+    println!("FILE......: {}", path.display());
+    println!();
+
+    println!("EXTRACTING TEXT...");
+    let (mut metadata, text) = extract_xls_text(&path).await?;
+
+    if let Some(metadata_path) = metadata_json {
+        let raw = std::fs::read_to_string(&metadata_path).with_context(|| {
+            format!("Failed to read metadata JSON: {}", metadata_path.display())
+        })?;
+        let overlay: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+            format!("Failed to parse metadata JSON: {}", metadata_path.display())
+        })?;
+        merge_metadata(&mut metadata, overlay)?;
+    }
+
+    println!("EXTRACTION COMPLETE");
+    println!("TEXT SIZE.: {} CHARACTERS", text.len());
+    println!(
+        "TITLE.....: {}",
+        metadata
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("N/A")
+    );
+    println!(
+        "SHEETS....: {}",
+        metadata
+            .get("sheet_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+    println!(
+        "ROWS......: {}",
+        metadata
+            .get("row_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+    println!();
+
+    print!("OPENING QUEUE...");
+    let config = CONFIG.get().expect("Config not initialized");
+    let queue = Queue::new(&queue_db_path(&config.db_path)).await?;
+    let conn = queue.connect().await?;
+    println!(" DONE");
+    println!();
+
+    let queue_id = conn
+        .enqueue(&format!("xls:{}", path.display()), &metadata, &text)
+        .await?;
+
+    println!();
+    println!("================================================================================");
+    println!("QUEUED FOR INGESTION  DOCID={}", queue_id);
     println!("================================================================================");
 
     Ok(())
@@ -977,7 +1244,7 @@ impl ServerHandler for CapsaServer {
     }
 }
 
-async fn show_status() -> Result<()> {
+async fn show_status(verbose: bool) -> Result<()> {
     let config = CONFIG.get().expect("Config not initialized");
     let queue = Queue::new(&queue_db_path(&config.db_path)).await?;
     let conn = queue.connect().await?;
@@ -992,6 +1259,42 @@ async fn show_status() -> Result<()> {
     println!("  DONE........: {}", status.done);
     println!("  FAILED......: {}", status.failed);
 
+    if verbose {
+        let chunked = conn.chunked_items().await?;
+        if !chunked.is_empty() {
+            println!();
+            println!("CHUNKED ITEMS (awaiting embedding)");
+            println!(
+                "--------------------------------------------------------------------------------"
+            );
+            for item in &chunked {
+                println!(
+                    "  {:>10} text  {:>8} chunks  {}",
+                    format_size(item.size),
+                    item.chunk_count.unwrap_or(0),
+                    item.display_name
+                );
+            }
+        }
+
+        let embedded = conn.embedded_items().await?;
+        if !embedded.is_empty() {
+            println!();
+            println!("EMBEDDED ITEMS (awaiting write)");
+            println!(
+                "--------------------------------------------------------------------------------"
+            );
+            for item in &embedded {
+                println!(
+                    "  {:>10} embeddings  {:>10} text  {}",
+                    format_size(item.size),
+                    format_size(item.aux_size.unwrap_or(0)),
+                    item.display_name
+                );
+            }
+        }
+    }
+
     let failed = conn.failed_items().await?;
     if !failed.is_empty() {
         println!();
@@ -1000,7 +1303,7 @@ async fn show_status() -> Result<()> {
             "--------------------------------------------------------------------------------"
         );
         for item in failed {
-            println!("  job_id={} source={}", item.job_id, item.source);
+            println!("  job_id={} name={}", item.job_id, item.display_name);
             println!("  error: {}", item.error);
             println!();
         }
@@ -1372,6 +1675,18 @@ async fn main() -> Result<()> {
         } => {
             add_pptx_document(path, metadata_json).await?;
         }
+        Commands::Txt {
+            path,
+            metadata_json,
+        } => {
+            add_txt_document(path, metadata_json).await?;
+        }
+        Commands::Xls {
+            path,
+            metadata_json,
+        } => {
+            add_xls_document(path, metadata_json).await?;
+        }
         Commands::Yt { id_or_url, lang } => {
             add_yt_document(id_or_url, lang).await?;
         }
@@ -1385,8 +1700,8 @@ async fn main() -> Result<()> {
         Commands::Serve { bind, rw } => {
             run_serve(bind, rw).await?;
         }
-        Commands::Status => {
-            show_status().await?;
+        Commands::Status { verbose } => {
+            show_status(verbose).await?;
         }
         Commands::Retry => {
             retry_failed().await?;

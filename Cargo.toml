@@ -43,6 +43,7 @@ yt-transcript-rs = "0.1.8"
 thiserror = "2.0"
 secrecy = "0.10.3"
 lz4_flex = { version = "0.11", features = ["frame"] }
+calamine = { version = "0.26", features = ["dates"] }
 rayon = "1"
 zip = "2"
 quick-xml = "0.37"
