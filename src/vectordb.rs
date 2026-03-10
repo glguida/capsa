@@ -444,6 +444,57 @@ impl VectorDatabaseConnection {
         Ok(doc_id)
     }
 
+    /// Inserts a document using pre-compressed content and pre-serialized embedding vectors.
+    ///
+    /// This is the pipeline-facing variant of `insert_document`. The caller is
+    /// responsible for LZ4-compressing the content and JSON-serializing the vectors
+    /// (both done outside the transaction for performance). This method only performs
+    /// the DB transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `compressed_content` - LZ4-frame-compressed document bytes
+    /// * `metadata`           - Document metadata as JSON
+    /// * `serialized`         - `(chunk_index, json_vector, chunk_start, chunk_end)` tuples
+    pub async fn insert_document_pre_compressed(
+        &self,
+        compressed_content: Vec<u8>,
+        metadata: serde_json::Value,
+        serialized: Vec<(usize, String, usize, usize)>,
+    ) -> Result<i64> {
+        let tx = self.conn.transaction().await?;
+
+        let doc_id: i64 = {
+            let mut rows = tx
+                .query(
+                    &self.schema.insert_document,
+                    (compressed_content, metadata.to_string()),
+                )
+                .await?;
+            rows.next()
+                .await?
+                .ok_or_else(|| DatabaseError::InsertFailed("No ID returned".to_string()))?
+                .get(0)?
+        };
+
+        for (i, vec_json, chunk_start, chunk_end) in serialized {
+            tx.execute(
+                &self.schema.insert_vectors,
+                (
+                    doc_id,
+                    i as i64,
+                    chunk_start as i64,
+                    chunk_end as i64,
+                    vec_json,
+                ),
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(doc_id)
+    }
+
     /// Searches for the top-k most similar document chunks using vector similarity.
     ///
     /// # Arguments

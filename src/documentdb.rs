@@ -50,6 +50,7 @@ use crate::pipeline::Pipeline;
 use crate::queue::{FailedItem, PipelineStatus, Queue, QueueConnection, queue_db_path};
 use crate::vectordb::{VectorDatabase, VectorDatabaseConnection};
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 type DocumentId = i64;
 
@@ -64,6 +65,8 @@ pub struct DocumentDatabaseConnection {
     /// Queue connection: insert, pipeline_status, failed_items.
     /// `None` for read-only connections (opened via `DocumentDatabase::new_reader`).
     queue: Option<QueueConnection>,
+    /// Wakes the chunk task when a new item is enqueued. `None` in read-only mode.
+    queue_ready: Option<Arc<Notify>>,
 }
 
 impl DocumentDatabaseConnection {
@@ -104,6 +107,9 @@ impl DocumentDatabaseConnection {
             ))
         })?;
         q.enqueue("", &metadata, text).await?;
+        if let Some(notify) = &self.queue_ready {
+            notify.notify_one();
+        }
         Ok(())
     }
 
@@ -198,6 +204,8 @@ pub struct DocumentDatabase {
     model: Option<String>,
     /// `None` in read-only or test configurations that skip the pipeline.
     _pipeline: Option<Pipeline>,
+    /// Shared with the pipeline's chunk task; notified on every enqueue.
+    queue_ready: Option<Arc<Notify>>,
 }
 
 impl DocumentDatabase {
@@ -231,7 +239,7 @@ impl DocumentDatabase {
 
         // Reset items stuck in 'processing' from a previous crash.
         let reset_conn = queue.connect().await?;
-        let reset_count = reset_conn.reset_processing().await?;
+        let reset_count = reset_conn.reset_pipeline().await?;
         if reset_count > 0 {
             tracing::warn!(
                 "reset {} in-flight queue items to 'pending' after restart",
@@ -249,12 +257,14 @@ impl DocumentDatabase {
         )
         .await?;
 
+        let queue_ready = Some(pipeline.queue_ready.clone());
         Ok(DocumentDatabase {
             embedder,
             vdb,
             queue: Some(queue),
             model: Some(config.model.clone()),
             _pipeline: Some(pipeline),
+            queue_ready,
         })
     }
 
@@ -288,6 +298,7 @@ impl DocumentDatabase {
             queue: None,
             model: Some(config.model.clone()),
             _pipeline: None,
+            queue_ready: None,
         })
     }
 
@@ -312,7 +323,8 @@ impl DocumentDatabase {
             vdb,
             queue: Some(queue),
             model: None,
-            _pipeline: None, // no pipeline in test configurations
+            _pipeline: None,
+            queue_ready: None,
         })
     }
 
@@ -332,6 +344,7 @@ impl DocumentDatabase {
             vconn,
             embedder,
             queue,
+            queue_ready: self.queue_ready.clone(),
         })
     }
 }
@@ -700,7 +713,8 @@ mod tests {
 
         let status = conn.pipeline_status().await?;
         assert_eq!(status.pending, 1);
-        assert_eq!(status.processing, 0);
+        assert_eq!(status.chunked, 0);
+        assert_eq!(status.embedded, 0);
         assert_eq!(status.done, 0);
 
         Ok(())

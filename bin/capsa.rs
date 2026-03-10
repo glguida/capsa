@@ -987,7 +987,8 @@ async fn show_status() -> Result<()> {
     println!("PIPELINE STATUS");
     println!("================================================================================");
     println!("  PENDING.....: {}", status.pending);
-    println!("  PROCESSING..: {}", status.processing);
+    println!("  CHUNKED.....: {}", status.chunked);
+    println!("  EMBEDDED....: {}", status.embedded);
     println!("  DONE........: {}", status.done);
     println!("  FAILED......: {}", status.failed);
 

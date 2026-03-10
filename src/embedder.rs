@@ -643,6 +643,9 @@ mod splitter_tests {
 
 use futures::stream::{self, StreamExt, TryStreamExt};
 
+const EMBED_BATCH_SIZE: usize = 32;
+const EMBED_CONCURRENT_BATCHES: usize = 1;
+
 /// High-level API for generating embeddings from various text sources.
 ///
 /// Combines an embedding implementation with text splitting to handle documents
@@ -722,10 +725,8 @@ impl Embedder {
     ///
     /// Returns an error if any API request fails.
     pub async fn embed_document(&self, text: &str) -> Result<Vec<(Vec<f32>, usize, usize)>> {
-        const BATCH_SIZE: usize = 32;
-
         stream::iter(self.splitter.document_chunks_with_offsets(text))
-            .chunks(BATCH_SIZE)
+            .chunks(EMBED_BATCH_SIZE)
             .map(|batch| async move {
                 let inputs: Vec<String> = batch
                     .iter()
@@ -740,7 +741,7 @@ impl Embedder {
                         .collect(),
                 )
             })
-            .buffered(20)
+            .buffered(EMBED_CONCURRENT_BATCHES)
             .try_fold(Vec::new(), |mut acc, batch_results| async move {
                 acc.extend(batch_results);
                 Ok(acc)
@@ -780,10 +781,8 @@ impl Embedder {
         &self,
         chunks: &[(String, usize, usize)],
     ) -> Result<Vec<(Vec<f32>, usize, usize)>> {
-        const BATCH_SIZE: usize = 32;
-
         stream::iter(chunks)
-            .chunks(BATCH_SIZE)
+            .chunks(EMBED_BATCH_SIZE)
             .map(|batch| async move {
                 let inputs: Vec<String> = batch.iter().map(|(text, _, _)| text.clone()).collect();
                 let embeddings = self.client.embed_batch(&inputs).await?;
@@ -795,7 +794,7 @@ impl Embedder {
                         .collect(),
                 )
             })
-            .buffered(20)
+            .buffered(EMBED_CONCURRENT_BATCHES)
             .try_fold(Vec::new(), |mut acc, batch_results| async move {
                 acc.extend(batch_results);
                 Ok(acc)

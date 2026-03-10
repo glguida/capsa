@@ -33,16 +33,23 @@ pub fn queue_db_path(db_path: &str) -> String {
 /// A document waiting to be ingested, as read from the queue.
 pub struct QueueItem {
     pub id: i64,
+    pub source: String,
     pub metadata: Value,
     pub text: String,
 }
 
-/// Pipeline status counts by state.
+/// Pipeline status counts by stage.
 #[derive(Debug, Clone, Default)]
 pub struct PipelineStatus {
+    /// Waiting to be chunked (in capsa_queue, status='pending').
     pub pending: u64,
-    pub processing: u64,
+    /// Chunked, waiting to be embedded (in pending_embeds).
+    pub chunked: u64,
+    /// Embedded and compressed, waiting to be written to the vector DB (in pending_writes).
+    pub embedded: u64,
+    /// Successfully written to the vector database.
     pub done: u64,
+    /// Failed at some stage.
     pub failed: u64,
 }
 
@@ -53,6 +60,26 @@ pub struct FailedItem {
     pub source: String,
     pub error: String,
     pub created_at: i64,
+}
+
+/// An item awaiting embedding, sitting in the pending_embeds table.
+pub struct PendingEmbed {
+    pub id: i64,
+    pub queue_id: i64,
+    pub source: String,
+    pub metadata: Value,
+    pub text: String,
+    pub chunks: Vec<(String, usize, usize)>,
+}
+
+/// An item awaiting a vector DB write, sitting in the pending_writes table.
+pub struct PendingWrite {
+    pub id: i64,
+    pub queue_id: i64,
+    pub source: String,
+    pub metadata: Value,
+    pub compressed_text: Vec<u8>,
+    pub embeddings_blob: Vec<u8>,
 }
 
 /// Owns the queue database and creates connections to it.
@@ -98,6 +125,42 @@ impl Queue {
             (),
         )
         .await?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pending_embeds (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                queue_id   INTEGER NOT NULL,
+                source     TEXT    NOT NULL,
+                metadata   TEXT    NOT NULL,
+                text       TEXT    NOT NULL,
+                chunks     TEXT    NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            )",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_embeds_id ON pending_embeds (id)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pending_writes (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                queue_id        INTEGER NOT NULL,
+                source          TEXT    NOT NULL,
+                metadata        TEXT    NOT NULL,
+                compressed_text BLOB    NOT NULL,
+                embeddings      BLOB    NOT NULL,
+                created_at      INTEGER NOT NULL DEFAULT (unixepoch())
+            )",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_writes_id ON pending_writes (id)",
+            (),
+        )
+        .await?;
         Ok(QueueConnection { conn })
     }
 }
@@ -131,7 +194,7 @@ impl QueueConnection {
         let items = {
             let mut rows = tx
                 .query(
-                    "SELECT id, metadata, text \
+                    "SELECT id, source, metadata, text \
                      FROM capsa_queue WHERE status = 'pending' ORDER BY id LIMIT ?1",
                     [limit as i64],
                 )
@@ -140,10 +203,16 @@ impl QueueConnection {
             let mut items = Vec::new();
             while let Some(row) = rows.next().await? {
                 let id: i64 = row.get(0)?;
-                let metadata_str: String = row.get(1)?;
-                let text: String = row.get(2)?;
+                let source: String = row.get(1)?;
+                let metadata_str: String = row.get(2)?;
+                let text: String = row.get(3)?;
                 let metadata: Value = serde_json::from_str(&metadata_str)?;
-                items.push(QueueItem { id, metadata, text });
+                items.push(QueueItem {
+                    id,
+                    source,
+                    metadata,
+                    text,
+                });
             }
             items
         };
@@ -247,8 +316,10 @@ impl QueueConnection {
         Ok(count)
     }
 
-    /// Returns item counts grouped by status.
+    /// Returns item counts for each pipeline stage.
     pub async fn status_counts(&self) -> Result<PipelineStatus> {
+        let mut status = PipelineStatus::default();
+
         let mut rows = self
             .conn
             .query(
@@ -256,18 +327,31 @@ impl QueueConnection {
                 (),
             )
             .await?;
-
-        let mut status = PipelineStatus::default();
         while let Some(row) = rows.next().await? {
             let name: String = row.get(0)?;
             let count: i64 = row.get(1)?;
             match name.as_str() {
                 "pending" => status.pending = count as u64,
-                "processing" => status.processing = count as u64,
                 "done" => status.done = count as u64,
                 "failed" => status.failed = count as u64,
                 _ => {}
             }
+        }
+
+        let mut rows = self
+            .conn
+            .query("SELECT COUNT(*) FROM pending_embeds", ())
+            .await?;
+        if let Some(row) = rows.next().await? {
+            status.chunked = row.get::<i64>(0)? as u64;
+        }
+
+        let mut rows = self
+            .conn
+            .query("SELECT COUNT(*) FROM pending_writes", ())
+            .await?;
+        if let Some(row) = rows.next().await? {
+            status.embedded = row.get::<i64>(0)? as u64;
         }
 
         Ok(status)
@@ -296,6 +380,248 @@ impl QueueConnection {
 
         Ok(items)
     }
+
+    /// Returns one pending queue item without modifying its state.
+    pub async fn peek_pending(&self) -> Result<Option<QueueItem>> {
+        let mut rows = self.conn.query(
+            "SELECT id, source, metadata, text FROM capsa_queue WHERE status = 'pending' ORDER BY id LIMIT 1",
+            (),
+        ).await?;
+        if let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let source: String = row.get(1)?;
+            let metadata_str: String = row.get(2)?;
+            let text: String = row.get(3)?;
+            let metadata: Value = serde_json::from_str(&metadata_str)?;
+            Ok(Some(QueueItem {
+                id,
+                source,
+                metadata,
+                text,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Returns up to `limit` pending queue items without modifying their state.
+    pub async fn peek_pending_batch(&self, limit: usize) -> Result<Vec<QueueItem>> {
+        let mut rows = self.conn.query(
+            "SELECT id, source, metadata, text FROM capsa_queue WHERE status = 'pending' ORDER BY id LIMIT ?1",
+            [limit as i64],
+        ).await?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let source: String = row.get(1)?;
+            let metadata_str: String = row.get(2)?;
+            let text: String = row.get(3)?;
+            let metadata: Value = serde_json::from_str(&metadata_str)?;
+            items.push(QueueItem {
+                id,
+                source,
+                metadata,
+                text,
+            });
+        }
+        Ok(items)
+    }
+
+    /// Atomically marks a queue item as 'processing' and inserts it into pending_embeds.
+    pub async fn promote_to_embeds(
+        &self,
+        queue_id: i64,
+        source: &str,
+        metadata: &Value,
+        text: &str,
+        chunks: &[(String, usize, usize)],
+    ) -> Result<()> {
+        let chunks_json = serde_json::to_string(chunks)?;
+        let metadata_str = serde_json::to_string(metadata)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        tx.execute(
+            "UPDATE capsa_queue SET status = 'processing', updated_at = unixepoch() WHERE id = ?1 AND status = 'pending'",
+            [queue_id],
+        ).await?;
+        tx.execute(
+            "INSERT INTO pending_embeds (queue_id, source, metadata, text, chunks) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (queue_id, source, metadata_str.as_str(), text, chunks_json.as_str()),
+        ).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Returns one pending embed item without modifying state.
+    pub async fn peek_embed(&self) -> Result<Option<PendingEmbed>> {
+        let mut rows = self.conn.query(
+            "SELECT id, queue_id, source, metadata, text, chunks FROM pending_embeds ORDER BY id LIMIT 1",
+            (),
+        ).await?;
+        if let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let queue_id: i64 = row.get(1)?;
+            let source: String = row.get(2)?;
+            let metadata_str: String = row.get(3)?;
+            let text: String = row.get(4)?;
+            let chunks_json: String = row.get(5)?;
+            let metadata: Value = serde_json::from_str(&metadata_str)?;
+            let chunks: Vec<(String, usize, usize)> = serde_json::from_str(&chunks_json)?;
+            Ok(Some(PendingEmbed {
+                id,
+                queue_id,
+                source,
+                metadata,
+                text,
+                chunks,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Atomically promotes an embed item to pending_writes and removes it from pending_embeds.
+    pub async fn promote_to_writes(
+        &self,
+        embed_id: i64,
+        queue_id: i64,
+        source: &str,
+        metadata: &Value,
+        compressed_text: Vec<u8>,
+        embeddings_blob: Vec<u8>,
+    ) -> Result<()> {
+        let metadata_str = serde_json::to_string(metadata)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        tx.execute(
+            "INSERT INTO pending_writes (queue_id, source, metadata, compressed_text, embeddings) VALUES (?1, ?2, ?3, ?4, ?5)",
+            libsql::params![queue_id, source, metadata_str.as_str(), compressed_text, embeddings_blob],
+        ).await?;
+        tx.execute("DELETE FROM pending_embeds WHERE id = ?1", [embed_id])
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Marks a queue item as failed and removes it from pending_embeds.
+    pub async fn fail_embed(&self, embed_id: i64, queue_id: i64, error: &str) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        tx.execute(
+            "UPDATE capsa_queue SET status = 'failed', error = ?1, updated_at = unixepoch() WHERE id = ?2",
+            (error, queue_id),
+        ).await?;
+        tx.execute("DELETE FROM pending_embeds WHERE id = ?1", [embed_id])
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Returns one pending write item without modifying state.
+    pub async fn peek_write(&self) -> Result<Option<PendingWrite>> {
+        let mut rows = self.conn.query(
+            "SELECT id, queue_id, source, metadata, compressed_text, embeddings FROM pending_writes ORDER BY id LIMIT 1",
+            (),
+        ).await?;
+        if let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let queue_id: i64 = row.get(1)?;
+            let source: String = row.get(2)?;
+            let metadata_str: String = row.get(3)?;
+            let compressed_text: Vec<u8> = row.get(4)?;
+            let embeddings_blob: Vec<u8> = row.get(5)?;
+            let metadata: Value = serde_json::from_str(&metadata_str)?;
+            Ok(Some(PendingWrite {
+                id,
+                queue_id,
+                source,
+                metadata,
+                compressed_text,
+                embeddings_blob,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Atomically marks the queue item done and removes it from pending_writes.
+    pub async fn complete_write(&self, write_id: i64, queue_id: i64) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        tx.execute(
+            "UPDATE capsa_queue SET status = 'done', updated_at = unixepoch() WHERE id = ?1",
+            [queue_id],
+        )
+        .await?;
+        tx.execute("DELETE FROM pending_writes WHERE id = ?1", [write_id])
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Marks a queue item as failed and removes it from pending_writes.
+    pub async fn fail_write(&self, write_id: i64, queue_id: i64, error: &str) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        tx.execute(
+            "UPDATE capsa_queue SET status = 'failed', error = ?1, updated_at = unixepoch() WHERE id = ?2",
+            (error, queue_id),
+        ).await?;
+        tx.execute("DELETE FROM pending_writes WHERE id = ?1", [write_id])
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Resets pipeline state on startup after a crash.
+    ///
+    /// Does NOT clear the intermediate tables — items already in `pending_embeds`
+    /// or `pending_writes` represent valid completed work and will be picked up
+    /// immediately by the embed/write threads' drain-first loops.
+    ///
+    /// Only fixes true orphans: `'processing'` items in `capsa_queue` that have
+    /// no row in either intermediate table. By transaction design this cannot
+    /// happen, but we reset them defensively so they are not stuck forever.
+    pub async fn reset_pipeline(&self) -> Result<u64> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        let mut rows = tx
+            .query(
+                "SELECT COUNT(*) FROM capsa_queue cq
+             WHERE cq.status = 'processing'
+               AND NOT EXISTS (SELECT 1 FROM pending_embeds pe WHERE pe.queue_id = cq.id)
+               AND NOT EXISTS (SELECT 1 FROM pending_writes pw WHERE pw.queue_id = cq.id)",
+                (),
+            )
+            .await?;
+        let count: u64 = rows
+            .next()
+            .await?
+            .map(|row| row.get::<i64>(0).unwrap_or(0) as u64)
+            .unwrap_or(0);
+        tx.execute(
+            "UPDATE capsa_queue SET status = 'pending', updated_at = unixepoch()
+             WHERE status = 'processing'
+               AND NOT EXISTS (SELECT 1 FROM pending_embeds pe WHERE pe.queue_id = id)
+               AND NOT EXISTS (SELECT 1 FROM pending_writes pw WHERE pw.queue_id = id)",
+            (),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -321,7 +647,8 @@ mod tests {
 
         let s = conn.status_counts().await.unwrap();
         assert_eq!(s.pending, 2);
-        assert_eq!(s.processing, 0);
+        assert_eq!(s.chunked, 0);
+        assert_eq!(s.embedded, 0);
         assert_eq!(s.done, 0);
         assert_eq!(s.failed, 0);
     }
@@ -340,7 +667,6 @@ mod tests {
 
         let s = conn.status_counts().await.unwrap();
         assert_eq!(s.pending, 1);
-        assert_eq!(s.processing, 2);
     }
 
     #[tokio::test]
@@ -370,7 +696,6 @@ mod tests {
 
         let s = conn.status_counts().await.unwrap();
         assert_eq!(s.done, 1);
-        assert_eq!(s.processing, 0);
     }
 
     #[tokio::test]
@@ -408,7 +733,6 @@ mod tests {
 
         let s = conn.status_counts().await.unwrap();
         assert_eq!(s.pending, 2);
-        assert_eq!(s.processing, 0);
     }
 
     #[tokio::test]
@@ -429,5 +753,169 @@ mod tests {
             queue_db_path("/path/to/capsa.db"),
             "/path/to/capsa-queue.db"
         );
+    }
+    // ── Pipeline stage tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_peek_pending_empty() {
+        let q = make_queue().await;
+        let conn = q.connect().await.unwrap();
+        assert!(conn.peek_pending().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_peek_pending_does_not_consume() {
+        let q = make_queue().await;
+        let conn = q.connect().await.unwrap();
+        conn.enqueue("pdf:a.pdf", &json!({}), "hello")
+            .await
+            .unwrap();
+        let item = conn.peek_pending().await.unwrap().unwrap();
+        assert_eq!(item.source, "pdf:a.pdf");
+        assert_eq!(item.text, "hello");
+        let s = conn.status_counts().await.unwrap();
+        assert_eq!(s.pending, 1);
+    }
+
+    #[tokio::test]
+    async fn test_promote_to_embeds() {
+        let q = make_queue().await;
+        let conn = q.connect().await.unwrap();
+        let id = conn
+            .enqueue("pdf:a.pdf", &json!({"k": "v"}), "text")
+            .await
+            .unwrap();
+        let chunks = vec![("search_document: text".to_string(), 0usize, 4usize)];
+        conn.promote_to_embeds(id, "pdf:a.pdf", &json!({"k": "v"}), "text", &chunks)
+            .await
+            .unwrap();
+        let s = conn.status_counts().await.unwrap();
+        assert_eq!(s.pending, 0);
+        assert_eq!(s.chunked, 1);
+        let embed = conn.peek_embed().await.unwrap().unwrap();
+        assert_eq!(embed.queue_id, id);
+        assert_eq!(embed.source, "pdf:a.pdf");
+        assert_eq!(embed.chunks.len(), 1);
+        assert_eq!(embed.chunks[0].0, "search_document: text");
+        assert_eq!(embed.chunks[0].1, 0);
+        assert_eq!(embed.chunks[0].2, 4);
+    }
+
+    #[tokio::test]
+    async fn test_promote_to_writes() {
+        let q = make_queue().await;
+        let conn = q.connect().await.unwrap();
+        let id = conn.enqueue("pdf:a.pdf", &json!({}), "text").await.unwrap();
+        let chunks = vec![("search_document: text".to_string(), 0usize, 4usize)];
+        conn.promote_to_embeds(id, "pdf:a.pdf", &json!({}), "text", &chunks)
+            .await
+            .unwrap();
+        let embed_id = conn.peek_embed().await.unwrap().unwrap().id;
+        conn.promote_to_writes(
+            embed_id,
+            id,
+            "pdf:a.pdf",
+            &json!({}),
+            vec![1, 2, 3],
+            vec![4, 5, 6],
+        )
+        .await
+        .unwrap();
+        assert!(conn.peek_embed().await.unwrap().is_none());
+        let write = conn.peek_write().await.unwrap().unwrap();
+        assert_eq!(write.queue_id, id);
+        assert_eq!(write.compressed_text, vec![1, 2, 3]);
+        assert_eq!(write.embeddings_blob, vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn test_complete_write() {
+        let q = make_queue().await;
+        let conn = q.connect().await.unwrap();
+        let id = conn.enqueue("pdf:a.pdf", &json!({}), "text").await.unwrap();
+        let chunks = vec![("c".to_string(), 0usize, 1usize)];
+        conn.promote_to_embeds(id, "pdf:a.pdf", &json!({}), "text", &chunks)
+            .await
+            .unwrap();
+        let embed_id = conn.peek_embed().await.unwrap().unwrap().id;
+        conn.promote_to_writes(embed_id, id, "pdf:a.pdf", &json!({}), vec![], vec![])
+            .await
+            .unwrap();
+        let write_id = conn.peek_write().await.unwrap().unwrap().id;
+        conn.complete_write(write_id, id).await.unwrap();
+        let s = conn.status_counts().await.unwrap();
+        assert_eq!(s.done, 1);
+        assert!(conn.peek_write().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fail_embed() {
+        let q = make_queue().await;
+        let conn = q.connect().await.unwrap();
+        let id = conn.enqueue("pdf:a.pdf", &json!({}), "text").await.unwrap();
+        let chunks = vec![("c".to_string(), 0usize, 1usize)];
+        conn.promote_to_embeds(id, "pdf:a.pdf", &json!({}), "text", &chunks)
+            .await
+            .unwrap();
+        let embed_id = conn.peek_embed().await.unwrap().unwrap().id;
+        conn.fail_embed(embed_id, id, "timeout").await.unwrap();
+        let s = conn.status_counts().await.unwrap();
+        assert_eq!(s.failed, 1);
+        assert!(conn.peek_embed().await.unwrap().is_none());
+        assert_eq!(conn.failed_items().await.unwrap()[0].error, "timeout");
+    }
+
+    #[tokio::test]
+    async fn test_fail_write() {
+        let q = make_queue().await;
+        let conn = q.connect().await.unwrap();
+        let id = conn.enqueue("pdf:a.pdf", &json!({}), "text").await.unwrap();
+        let chunks = vec![("c".to_string(), 0usize, 1usize)];
+        conn.promote_to_embeds(id, "pdf:a.pdf", &json!({}), "text", &chunks)
+            .await
+            .unwrap();
+        let embed_id = conn.peek_embed().await.unwrap().unwrap().id;
+        conn.promote_to_writes(embed_id, id, "pdf:a.pdf", &json!({}), vec![], vec![])
+            .await
+            .unwrap();
+        let write_id = conn.peek_write().await.unwrap().unwrap().id;
+        conn.fail_write(write_id, id, "db error").await.unwrap();
+        let s = conn.status_counts().await.unwrap();
+        assert_eq!(s.failed, 1);
+        assert!(conn.peek_write().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reset_pipeline_preserves_intermediate_tables() {
+        let q = make_queue().await;
+        let conn = q.connect().await.unwrap();
+        let id = conn.enqueue("pdf:a.pdf", &json!({}), "text").await.unwrap();
+        let chunks = vec![("c".to_string(), 0usize, 1usize)];
+        conn.promote_to_embeds(id, "pdf:a.pdf", &json!({}), "text", &chunks)
+            .await
+            .unwrap();
+        // Item is now 'processing' in capsa_queue with a row in pending_embeds.
+        // reset_pipeline should NOT disturb it — the embed thread can resume.
+        let reset = conn.reset_pipeline().await.unwrap();
+        assert_eq!(reset, 0); // no orphans
+        assert!(conn.peek_embed().await.unwrap().is_some()); // still in pending_embeds
+        let s = conn.status_counts().await.unwrap();
+        assert_eq!(s.pending, 0);
+        assert_eq!(s.chunked, 1); // preserved
+    }
+
+    #[tokio::test]
+    async fn test_reset_pipeline_fixes_orphans() {
+        // Simulate an orphan: 'processing' in capsa_queue but nothing in intermediate tables.
+        // This can't happen via normal code paths (transactions), but we test the safety net.
+        // Use dequeue_batch to move items to 'processing' without inserting into pending_embeds.
+        let q = make_queue().await;
+        let conn = q.connect().await.unwrap();
+        conn.enqueue("pdf:a.pdf", &json!({}), "text").await.unwrap();
+        let _ = conn.dequeue_batch(1).await.unwrap(); // sets status='processing', no intermediate row
+        let reset = conn.reset_pipeline().await.unwrap();
+        assert_eq!(reset, 1);
+        let s = conn.status_counts().await.unwrap();
+        assert_eq!(s.pending, 1);
     }
 }
