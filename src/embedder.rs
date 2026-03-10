@@ -332,39 +332,22 @@ mod client_tests {
     }
 }
 
-use text_splitter::{ChunkConfig, TextSplitter};
 use tokenizers::tokenizer::Tokenizer;
 
 /// Handles text splitting and chunking for embedding generation.
 ///
-/// This splitter manages token limits and overlap for both queries and documents,
-/// ensuring text fits within the model's context window.
+/// Tokenizes the entire document once, then uses a sliding window over the
+/// resulting token offsets to produce chunks — O(1) tokenizer calls per document
+/// instead of O(N log N) with a sizer-based splitter.
 #[derive(Debug)]
 pub struct EmbeddingSplitter {
-    query_splitter: TextSplitter<Tokenizer>,
-    document_splitter: TextSplitter<Tokenizer>,
+    tokenizer: Tokenizer,
+    query_chunk_len: usize,
+    document_chunk_len: usize,
+    overlap_len: usize,
 }
 
 impl EmbeddingSplitter {
-    fn create_splitter(
-        n_ctx: usize,
-        prefix: &str,
-        tokenizer: Tokenizer,
-        overlap: f32,
-    ) -> Result<TextSplitter<Tokenizer>> {
-        let prefix_len = tokenizer
-            .encode(prefix, true)
-            .map_err(|e| EmbeddingError::TokenizationFailed(e.to_string()))?
-            .get_ids()
-            .len();
-        let chunk_len = n_ctx - prefix_len;
-        let overlap_len: usize = ((chunk_len as f32) * overlap) as usize;
-        let config = ChunkConfig::new(chunk_len)
-            .with_sizer(tokenizer)
-            .with_overlap(overlap_len)?;
-        Ok(TextSplitter::new(config))
-    }
-
     /// Creates a new embedding splitter with the specified model and context size.
     ///
     /// # Arguments
@@ -380,80 +363,92 @@ impl EmbeddingSplitter {
     ///
     /// Returns an error if the tokenizer cannot be loaded.
     pub fn new(model: &str, n_ctx: usize) -> Result<Self> {
-        let overlap = 0.05; /* 5% overlap */
         let tokenizer =
             Tokenizer::from_pretrained(model, None).map_err(|e| EmbeddingError::TokenizerLoad {
                 model: model.to_string(),
                 message: e.to_string(),
             })?;
-        let query_splitter =
-            Self::create_splitter(n_ctx, "search_query: ", tokenizer.clone(), overlap)?;
-        let document_splitter =
-            Self::create_splitter(n_ctx, "search_document: ", tokenizer, overlap)?;
+
+        // Encode each prefix with special tokens to account for CLS/SEP overhead.
+        let query_prefix_len = tokenizer
+            .encode("search_query: ", true)
+            .map_err(|e| EmbeddingError::TokenizationFailed(e.to_string()))?
+            .get_ids()
+            .len();
+        let doc_prefix_len = tokenizer
+            .encode("search_document: ", true)
+            .map_err(|e| EmbeddingError::TokenizationFailed(e.to_string()))?
+            .get_ids()
+            .len();
+
+        let query_chunk_len = n_ctx.saturating_sub(query_prefix_len);
+        let document_chunk_len = n_ctx.saturating_sub(doc_prefix_len);
+        let overlap_len = ((document_chunk_len as f32) * 0.05) as usize;
+
         Ok(EmbeddingSplitter {
-            query_splitter,
-            document_splitter,
+            tokenizer,
+            query_chunk_len,
+            document_chunk_len,
+            overlap_len,
         })
     }
 
     /// Truncates query text to fit within the context window.
     ///
-    /// Returns the first chunk of the text that fits within the query token limit,
-    /// accounting for the "query_document: " prefix.
-    ///
-    /// # Arguments
-    ///
-    /// * `text` - The query text to truncate
-    ///
-    /// # Returns
-    ///
-    /// A string slice containing the truncated text, or empty string if input is empty.
+    /// Tokenizes the text once and returns the prefix that fits within
+    /// `query_chunk_len` tokens, accounting for the "search_query: " prefix.
     pub fn truncate_query<'a>(&self, text: &'a str) -> &'a str {
-        self.query_splitter.chunks(text).next().unwrap_or("")
+        if text.is_empty() {
+            return "";
+        }
+        let enc = match self.tokenizer.encode(text, false) {
+            Ok(e) => e,
+            Err(_) => return text,
+        };
+        let offsets = enc.get_offsets();
+        if offsets.is_empty() {
+            return "";
+        }
+        let last = self.query_chunk_len.min(offsets.len()) - 1;
+        &text[..offsets[last].1]
     }
 
     /// Splits document text into overlapping chunks that fit within the context window.
-    ///
-    /// Returns an iterator over text chunks, each sized to fit within the document
-    /// token limit with 5% overlap between consecutive chunks. Accounts for the
-    /// "search_document: " prefix.
-    ///
-    /// # Arguments
-    ///
-    /// * `text` - The document text to split
-    ///
-    /// # Returns
-    ///
-    /// An iterator yielding string slices for each chunk.
     pub fn document_chunks<'a>(&'a self, text: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-        self.document_splitter.chunks(text)
+        self.document_chunks_with_offsets(text)
+            .map(|(chunk, _, _)| chunk)
     }
 
     /// Splits document text into overlapping chunks with byte offset positions.
     ///
-    /// Returns an iterator over text chunks along with their start and end byte offsets
-    /// in the original text. Each chunk is sized to fit within the document token limit
-    /// with 5% overlap between consecutive chunks. Accounts for the "search_document: " prefix.
-    ///
-    /// The byte offsets are guaranteed to fall on UTF-8 character boundaries since the
-    /// chunks are valid string slices from the original text.
-    ///
-    /// # Arguments
-    ///
-    /// * `text` - The document text to split
-    ///
-    /// # Returns
-    ///
-    /// An iterator yielding tuples of (chunk, start_byte, end_byte) for each chunk.
+    /// Tokenizes `text` exactly once, then slides a window of `document_chunk_len`
+    /// tokens with `overlap_len` token overlap, mapping each window back to byte
+    /// offsets in the original string.
     pub fn document_chunks_with_offsets<'a>(
         &'a self,
         text: &'a str,
     ) -> impl Iterator<Item = (&'a str, usize, usize)> + 'a {
-        self.document_splitter.chunks(text).map(move |chunk| {
-            // Calculate byte offset from the original string
-            let start = chunk.as_ptr() as usize - text.as_ptr() as usize;
-            let end = start + chunk.len();
-            (chunk, start, end)
+        // One tokenizer call for the entire document.
+        let offsets: Vec<(usize, usize)> = self
+            .tokenizer
+            .encode(text, false)
+            .map(|enc| enc.get_offsets().to_vec())
+            .unwrap_or_default();
+
+        let n = offsets.len();
+        let chunk_len = self.document_chunk_len;
+        let step = chunk_len.saturating_sub(self.overlap_len).max(1);
+        let mut pos = 0usize;
+
+        std::iter::from_fn(move || {
+            if pos >= n {
+                return None;
+            }
+            let end = (pos + chunk_len).min(n);
+            let byte_start = offsets[pos].0;
+            let byte_end = offsets[end - 1].1;
+            pos += step;
+            Some((&text[byte_start..byte_end], byte_start, byte_end))
         })
     }
 }
@@ -736,6 +731,61 @@ impl Embedder {
                     .iter()
                     .map(|(chunk, _, _)| format!("search_document: {}", chunk))
                     .collect();
+                let embeddings = self.client.embed_batch(&inputs).await?;
+                Ok::<Vec<_>, crate::error::CapsaError>(
+                    embeddings
+                        .into_iter()
+                        .zip(batch.iter())
+                        .map(|(emb, (_, start, end))| (emb, *start, *end))
+                        .collect(),
+                )
+            })
+            .buffered(20)
+            .try_fold(Vec::new(), |mut acc, batch_results| async move {
+                acc.extend(batch_results);
+                Ok(acc)
+            })
+            .await
+    }
+
+    /// Splits document text into prefixed chunks ready for embedding.
+    ///
+    /// Returns owned `("search_document: <chunk>", byte_start, byte_end)` tuples.
+    /// This is the CPU-bound step performed by the pipeline's QueuePoller (Stage 1),
+    /// separate from the async embedding step done by the EmbedderTask (Stage 2).
+    pub(crate) fn chunk_document(&self, text: &str) -> Vec<(String, usize, usize)> {
+        self.splitter
+            .document_chunks_with_offsets(text)
+            .map(|(chunk, start, end)| (format!("search_document: {}", chunk), start, end))
+            .collect()
+    }
+
+    /// Generates embeddings for pre-chunked, pre-prefixed document chunks.
+    ///
+    /// This is the pipeline-facing counterpart to `embed_document`. The caller
+    /// (Stage 1 / QueuePoller) is responsible for splitting the text and prepending
+    /// the `"search_document: "` prefix to each chunk. This method only handles
+    /// batched embedding of the resulting strings.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunks` - Tuples of `(prefixed_chunk_text, byte_start, byte_end)` where
+    ///   offsets are relative to the original document text.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(embedding_vector, chunk_start, chunk_end)` in the same order
+    /// as the input chunks.
+    pub async fn embed_chunks(
+        &self,
+        chunks: &[(String, usize, usize)],
+    ) -> Result<Vec<(Vec<f32>, usize, usize)>> {
+        const BATCH_SIZE: usize = 32;
+
+        stream::iter(chunks)
+            .chunks(BATCH_SIZE)
+            .map(|batch| async move {
+                let inputs: Vec<String> = batch.iter().map(|(text, _, _)| text.clone()).collect();
                 let embeddings = self.client.embed_batch(&inputs).await?;
                 Ok::<Vec<_>, crate::error::CapsaError>(
                     embeddings

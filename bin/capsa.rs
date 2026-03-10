@@ -109,6 +109,8 @@ enum Commands {
     },
     /// Show the current state of the ingestion pipeline queue.
     Status,
+    /// Re-queue all failed ingestion jobs so they are retried.
+    Retry,
 }
 
 async fn extract_pdf_metadata_and_text(
@@ -1006,6 +1008,19 @@ async fn show_status() -> Result<()> {
     Ok(())
 }
 
+async fn retry_failed() -> Result<()> {
+    let config = CONFIG.get().expect("Config not initialized");
+    let queue = Queue::new(&queue_db_path(&config.db_path)).await?;
+    let conn = queue.connect().await?;
+    let count = conn.retry_failed().await?;
+    if count == 0 {
+        println!("No failed jobs to retry.");
+    } else {
+        println!("Re-queued {} failed job(s).", count);
+    }
+    Ok(())
+}
+
 async fn run_serve(bind: String, rw: bool) -> Result<()> {
     println!("================================================================================");
     println!("CAPSA MCP SERVER");
@@ -1371,6 +1386,9 @@ async fn main() -> Result<()> {
         }
         Commands::Status => {
             show_status().await?;
+        }
+        Commands::Retry => {
+            retry_failed().await?;
         }
     }
 

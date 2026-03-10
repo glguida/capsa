@@ -20,12 +20,16 @@ name = "compression_benchmark"
 path = "benches/compression_benchmark.rs"
 harness = false
 
+[[bench]]
+name = "tokenization_benchmark"
+path = "benches/tokenization_benchmark.rs"
+harness = false
+
 [dependencies]
 anyhow = "1.0.100"
 async-openai = { version = "0.32.2", features = ["embedding"] }
 async-trait = "0.1"
 tokio = { version = "1.48.0", features = ["full"] }
-text-splitter = { version = "0.28", features = ["tokenizers"] }
 tokenizers = { version = "0.22", features = ["http"] }
 stream = "0.1.0"
 futures = "0.3.31"
@@ -51,5 +55,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.0"
+text-splitter = { version = "0.28", features = ["tokenizers"] }
 
 

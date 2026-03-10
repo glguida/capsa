@@ -26,13 +26,13 @@
 //!     let db = DocumentDatabase::new(&config).await?;
 //!     let conn = db.connect().await?;
 //!
-//!     // Index a document
-//!     let doc_id = conn.insert(
+//!     // Queue a document for ingestion (returns immediately)
+//!     conn.insert(
 //!         json!({"title": "Example Document"}),
 //!         "Your document text here"
 //!     ).await?;
 //!
-//!     // Search for similar content
+//!     // Search for similar content (queries are always synchronous)
 //!     let results = conn.search_topk("your search query", 5).await?;
 //!     for (doc_id, metadata, start, end) in results {
 //!         println!("Found match in document {}: bytes {}-{}", doc_id, start, end);
@@ -60,6 +60,8 @@ pub mod documentdb;
 pub mod embedder;
 pub mod error;
 pub mod executor;
+pub(crate) mod pipeline;
+pub mod queue;
 pub mod vectordb;
 
 #[cfg(test)]

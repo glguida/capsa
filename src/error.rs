@@ -52,10 +52,6 @@ pub enum EmbeddingError {
     /// Error when input is invalid (e.g., empty when it shouldn't be)
     #[error("Invalid input: {0}")]
     InvalidInput(String),
-
-    /// Error with text chunking configuration
-    #[error("Failed to configure text chunking: {0}")]
-    ChunkConfigError(#[from] text_splitter::ChunkConfigError),
 }
 
 /// Errors related to database operations
@@ -113,12 +109,6 @@ impl From<libsql::Error> for CapsaError {
 impl From<serde_json::Error> for CapsaError {
     fn from(err: serde_json::Error) -> Self {
         CapsaError::Processing(ProcessingError::Json(err))
-    }
-}
-
-impl From<text_splitter::ChunkConfigError> for CapsaError {
-    fn from(err: text_splitter::ChunkConfigError) -> Self {
-        CapsaError::Embedding(EmbeddingError::ChunkConfigError(err))
     }
 }
 

@@ -185,6 +185,37 @@ impl QueueConnection {
         Ok(())
     }
 
+    /// Resets all `failed` items back to `pending` for re-ingestion.
+    ///
+    /// Returns the number of items re-queued.
+    pub async fn retry_failed(&self) -> Result<u64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM capsa_queue WHERE status = 'failed'",
+                (),
+            )
+            .await?;
+        let count: u64 = rows
+            .next()
+            .await?
+            .map(|row| row.get::<i64>(0).unwrap_or(0) as u64)
+            .unwrap_or(0);
+
+        if count > 0 {
+            self.conn
+                .execute(
+                    "UPDATE capsa_queue \
+                     SET status = 'pending', error = NULL, updated_at = unixepoch() \
+                     WHERE status = 'failed'",
+                    (),
+                )
+                .await?;
+        }
+
+        Ok(count)
+    }
+
     /// Resets all `processing` items back to `pending`.
     ///
     /// Called on startup to recover items that were in-flight when the process
