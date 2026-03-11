@@ -18,11 +18,12 @@ use rmcp::{
 use serde_json::json;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use yt_transcript_rs::YouTubeTranscriptApi;
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
+const MAX_INGEST_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "capsa")]
@@ -410,6 +411,10 @@ async fn add_pptx_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Res
     println!("FILE......: {}", path.display());
     println!();
 
+    if skip_oversized_ingest_file(&path)? {
+        return Ok(());
+    }
+
     println!("EXTRACTING TEXT...");
     let (mut metadata, text) = extract_pptx_metadata_and_text(&path).await?;
 
@@ -466,7 +471,7 @@ async fn add_pptx_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Res
     Ok(())
 }
 
-fn format_size(bytes: usize) -> String {
+fn format_size_u64(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else if bytes >= 1024 {
@@ -474,6 +479,35 @@ fn format_size(bytes: usize) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+fn format_size(bytes: usize) -> String {
+    format_size_u64(bytes as u64)
+}
+
+fn oversized_ingest_file_error(path: &Path) -> Result<Option<String>> {
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("Failed to read file metadata: {}", path.display()))?
+        .len();
+
+    if size > MAX_INGEST_FILE_SIZE_BYTES {
+        return Ok(Some(format!(
+            "ERROR: file is too big to ingest: {} ({}) exceeds the {} limit",
+            path.display(),
+            format_size_u64(size),
+            format_size_u64(MAX_INGEST_FILE_SIZE_BYTES),
+        )));
+    }
+
+    Ok(None)
+}
+
+fn skip_oversized_ingest_file(path: &Path) -> Result<bool> {
+    if let Some(message) = oversized_ingest_file_error(path)? {
+        eprintln!("{message}");
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn merge_metadata(base: &mut serde_json::Value, overlay: serde_json::Value) -> Result<()> {
@@ -601,6 +635,10 @@ async fn add_pdf_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Resu
     println!("FILE......: {}", path.display());
     println!();
 
+    if skip_oversized_ingest_file(&path)? {
+        return Ok(());
+    }
+
     println!("EXTRACTING TEXT...");
     let (mut metadata, text) = extract_pdf_metadata_and_text(&path).await?;
 
@@ -656,6 +694,10 @@ async fn add_txt_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Resu
     println!("================================================================================");
     println!("FILE......: {}", path.display());
     println!();
+
+    if skip_oversized_ingest_file(&path)? {
+        return Ok(());
+    }
 
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read text file: {}", path.display()))?;
@@ -829,6 +871,10 @@ async fn add_xls_document(path: PathBuf, metadata_json: Option<PathBuf>) -> Resu
     println!("================================================================================");
     println!("FILE......: {}", path.display());
     println!();
+
+    if skip_oversized_ingest_file(&path)? {
+        return Ok(());
+    }
 
     println!("EXTRACTING TEXT...");
     let (mut metadata, text) = extract_xls_text(&path).await?;
@@ -1646,6 +1692,30 @@ mod tests {
             metadata.get("slide_count").and_then(|v| v.as_u64()),
             Some(5)
         );
+    }
+
+    fn make_temp_file_with_size(size: u64) -> NamedTempFile {
+        let tmp = NamedTempFile::new().expect("tempfile");
+        tmp.as_file().set_len(size).expect("set file size");
+        tmp
+    }
+
+    #[test]
+    fn test_ingest_size_limit_allows_files_up_to_limit() {
+        let tmp = make_temp_file_with_size(MAX_INGEST_FILE_SIZE_BYTES);
+
+        assert_eq!(oversized_ingest_file_error(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_ingest_size_limit_rejects_files_over_limit() {
+        let tmp = make_temp_file_with_size(MAX_INGEST_FILE_SIZE_BYTES + 1);
+
+        let message = oversized_ingest_file_error(tmp.path())
+            .unwrap()
+            .expect("oversized file should be rejected");
+        assert!(message.contains("too big to ingest"));
+        assert!(message.contains("4.0 MB limit"));
     }
 }
 
